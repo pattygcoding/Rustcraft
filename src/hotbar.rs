@@ -4,7 +4,7 @@
 //! block icons (see [`Hotbar::mesh_data`]) with the selected slot enlarged, so you
 //! can always see what you are about to place.
 
-use crate::gfx::mesh::{MeshData, Vertex};
+use crate::gfx::mesh::{FULL_LIGHT, GeometryData, MeshData, Vertex};
 use crate::gfx::texture::BlockTextures;
 use crate::world::Block;
 
@@ -33,7 +33,13 @@ impl Hotbar {
     /// The default hotbar (one slot per placeable block).
     pub fn new() -> Self {
         Self {
-            blocks: vec![Block::Grass, Block::Dirt, Block::Stone, Block::Bedrock],
+            blocks: vec![
+                Block::Grass,
+                Block::Dirt,
+                Block::Stone,
+                Block::Water,
+                Block::Bedrock,
+            ],
             selected: 0,
         }
     }
@@ -78,24 +84,26 @@ impl Hotbar {
             } else {
                 1.0
             };
-            // Use the block's top texture as its icon.
+            // Use the block's top texture as its icon, tinted like the block itself
+            // (so water reads blue in the HUD too). The HUD is a single unblended
+            // pass, so it fills the opaque set and is drawn with the UI pipeline.
             let layer = block.faces(textures).layers[2];
             push_icon(
-                &mut data,
+                &mut data.opaque,
                 [x, y],
                 [half_width * scale, half_height * scale],
                 layer,
+                block.tint(),
             );
         }
 
-        data.opaque_index_count = data.indices.len() as u32;
         data
     }
 }
 
 /// Append a textured screen-space quad centred at `center` (in NDC).
-fn push_icon(data: &mut MeshData, center: [f32; 2], half: [f32; 2], layer: u32) {
-    let base = data.vertices.len() as u32;
+fn push_icon(geometry: &mut GeometryData, center: [f32; 2], half: [f32; 2], layer: u32, tint: u32) {
+    let base = geometry.vertices.len() as u32;
     // (corner offset, uv) — top-left first so the icon is upright.
     let corners = [
         ([-1.0, 1.0], [0.0, 0.0]),
@@ -104,7 +112,7 @@ fn push_icon(data: &mut MeshData, center: [f32; 2], half: [f32; 2], layer: u32) 
         ([-1.0, -1.0], [0.0, 1.0]),
     ];
     for (corner, uv) in corners {
-        data.vertices.push(Vertex {
+        geometry.vertices.push(Vertex {
             position: [
                 center[0] + corner[0] * half[0],
                 center[1] + corner[1] * half[1],
@@ -112,9 +120,13 @@ fn push_icon(data: &mut MeshData, center: [f32; 2], half: [f32; 2], layer: u32) 
             ],
             uv,
             layer,
+            // The HUD is not part of the world, so it is drawn fully lit.
+            light: FULL_LIGHT,
+            tint,
         });
     }
-    data.indices
+    geometry
+        .indices
         .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
 }
 

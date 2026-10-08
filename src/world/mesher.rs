@@ -42,16 +42,25 @@ pub fn mesh_chunk(
         for z in 0..DEPTH {
             for x in 0..WIDTH {
                 let block = chunk.get(x as i32, y as i32, z as i32);
-                if !block.is_solid() {
+                if block.is_air() {
                     continue;
                 }
 
                 let faces = block.faces(textures);
+                let tint = block.tint();
+                // Opaque blocks belong to the depth-writing pass, translucent ones
+                // (water) to the blended pass, so each can be drawn its own way.
+                let geometry = if block.is_opaque() {
+                    &mut data.opaque
+                } else {
+                    &mut data.translucent
+                };
+
                 for (face, [dx, dy, dz]) in NEIGHBOURS.iter().copied().enumerate() {
                     let (nx, ny, nz) = (x as i32 + dx, y as i32 + dy, z as i32 + dz);
-                    // Skip faces hidden behind a solid neighbour (in this chunk or
-                    // a neighbouring one).
-                    if neighbour_block(chunk, origin, world, nx, ny, nz).is_solid() {
+                    // Skip faces the neighbour hides — an opaque block hides every
+                    // face, water only hides other water (see `Block::hides_face_of`).
+                    if neighbour_block(chunk, origin, world, nx, ny, nz).hides_face_of(block) {
                         continue;
                     }
 
@@ -60,21 +69,25 @@ pub fn mesh_chunk(
                         (origin[1] + y as i32) as f32,
                         (origin[2] + z as i32) as f32,
                     ];
+                    // A face shows the light of the open cell it looks into, so a
+                    // block in shadow comes out dark. The face index rides along so
+                    // the shader can shade each side of the block differently.
+                    let sky = world.light(origin[0] + nx, origin[1] + ny, origin[2] + nz);
+                    let light = mesh::pack_light(sky, 0, face);
                     mesh::push_face(
-                        &mut data.vertices,
-                        &mut data.indices,
+                        &mut geometry.vertices,
+                        &mut geometry.indices,
                         block_origin,
                         face,
                         faces.layers[face],
+                        light,
+                        tint,
                     );
                 }
             }
         }
     }
 
-    // All current blocks are opaque; transparent faces would be appended after
-    // this point and recorded via a smaller `opaque_index_count`.
-    data.opaque_index_count = data.indices.len() as u32;
     data
 }
 

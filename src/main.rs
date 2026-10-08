@@ -29,7 +29,7 @@ use crate::camera::Camera;
 use crate::gfx::Renderer;
 use crate::hotbar::Hotbar;
 use crate::input::Input;
-use crate::world::{Block, World};
+use crate::world::{Block, DEFAULT_SEED, SEA_LEVEL, World};
 
 /// Title shown in the window's title bar.
 const WINDOW_TITLE: &str = "Rustcraft";
@@ -40,6 +40,9 @@ const WINDOW_SIZE: LogicalSize<f64> = LogicalSize::new(1280.0, 720.0);
 /// How far (in blocks) the player can reach to break a block, like Minecraft's
 /// block-reach.
 const REACH: f32 = 6.0;
+
+/// Eye height above the ground where the player spawns, in blocks.
+const SPAWN_EYE_HEIGHT: f32 = 1.62;
 
 fn main() -> Result<(), winit::error::EventLoopError> {
     // `RUST_LOG=info` (or `debug`) enables logs; wgpu/winit log through `log`.
@@ -102,9 +105,18 @@ impl ApplicationHandler for App {
         // self-referential borrow between the window and its renderer.
         self.renderer = Some(Renderer::new(window.clone()));
 
-        // Load the first chunks around the camera's starting position.
-        let mut world = World::new();
+        // The terrain seed; set `RUSTCRAFT_SEED=<n>` for a different world.
+        let seed = std::env::var("RUSTCRAFT_SEED")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(DEFAULT_SEED);
+        log::info!("terrain seed: {seed}");
+
+        // Load the first chunks around the camera's starting position, then stand
+        // the camera on the ground there.
+        let mut world = World::new(seed);
         world.update(self.camera.position.x, self.camera.position.z);
+        place_camera_on_surface(&mut self.camera, &world);
         log::info!("world: {} chunks loaded", world.loaded_count());
         self.world = Some(world);
 
@@ -235,10 +247,23 @@ fn place_looked_at_block(world: &mut World, camera: &Camera, block: Block) {
         hit.block[1] + hit.normal[1],
         hit.block[2] + hit.normal[2],
     );
-    // Only place into empty space.
-    if !world.block(px, py, pz).is_solid() {
+    // Only place into space that is not already an opaque block. Water counts as
+    // free space, so you can build into the sea.
+    if !world.block(px, py, pz).is_opaque() {
         world.set_block(px, py, pz, block);
     }
+}
+
+/// Stand the camera at eye height on the ground at its current `x`/`z`.
+///
+/// `World::surface_height` reports the topmost *terrain* block, so the walkable
+/// surface is one block above it — unless that ground is under water, in which case
+/// the camera stands on the sea.
+fn place_camera_on_surface(camera: &mut Camera, world: &World) {
+    let x = camera.position.x.floor() as i32;
+    let z = camera.position.z.floor() as i32;
+    let ground = world.surface_height(x, z).max(SEA_LEVEL);
+    camera.position.y = (ground + 1) as f32 + SPAWN_EYE_HEIGHT;
 }
 
 /// Grab or release the cursor for first-person mouse-look.
@@ -264,22 +289,30 @@ fn set_cursor_captured(window: &Window, captured: bool) {
 mod tests {
     use super::*;
 
-    /// The starting camera should be looking at a block it can reach and break,
-    /// so breaking works the moment the game opens.
+    /// The camera should spawn standing on the ground — or on the sea, when the
+    /// ground there is under water — never buried inside a block.
     #[test]
-    fn default_camera_can_reach_a_block() {
-        let mut world = World::new();
-        let camera = Camera::default();
+    fn the_starting_camera_stands_on_ground_or_sea() {
+        let mut world = World::new(DEFAULT_SEED);
+        let mut camera = Camera::default();
         world.update(camera.position.x, camera.position.z);
+        place_camera_on_surface(&mut camera, &world);
 
-        let hit = world
-            .raycast(camera.position, camera.forward(), REACH)
-            .expect("the starting camera should be looking at a block");
-        let [x, y, z] = hit.block;
-        assert!(world.block(x, y, z).is_breakable());
+        let x = camera.position.x.floor() as i32;
+        let z = camera.position.z.floor() as i32;
+        let underfoot = world.surface_height(x, z).max(SEA_LEVEL);
 
-        // ...and the cell in front of it is empty, so a block can be placed there.
-        let (px, py, pz) = (x + hit.normal[0], y + hit.normal[1], z + hit.normal[2]);
-        assert!(!world.block(px, py, pz).is_solid());
+        // Ground where the spawn is on land, water where it is over the sea.
+        let below = world.block(x, underfoot, z);
+        assert!(
+            below.is_opaque() || below == Block::Water,
+            "nothing to stand on: {below:?}"
+        );
+        // ...and the cell the camera occupies is clear, so it is not buried.
+        let head = camera.position.y.floor() as i32;
+        assert!(
+            !world.block(x, head, z).is_opaque(),
+            "spawned inside a block"
+        );
     }
 }

@@ -12,7 +12,9 @@
 
 mod block;
 mod chunk;
+mod light;
 mod mesher;
+mod terrain;
 
 use std::collections::{HashMap, HashSet};
 
@@ -21,6 +23,7 @@ use glam::Vec3;
 pub use block::Block;
 pub use chunk::Chunk;
 pub use mesher::mesh_chunk;
+pub use terrain::{DEFAULT_SEED, SEA_LEVEL, Terrain};
 
 /// How many chunks out from the player's chunk stay loaded (a square patch, so
 /// `(2 * RENDER_RADIUS + 1)²` chunks in total).
@@ -29,10 +32,13 @@ pub const RENDER_RADIUS: i32 = 6;
 /// The position of a chunk, in chunk units.
 pub type ChunkPos = (i32, i32);
 
+/// The horizontal size of a chunk, in blocks.
+pub const CHUNK_SIZE: i32 = chunk::WIDTH as i32;
+
 /// A block hit by a [`World::raycast`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RayHit {
-    /// Coordinates of the solid block that was hit.
+    /// Coordinates of the opaque block that was hit.
     pub block: [i32; 3],
     /// Unit axis of the face that was entered (e.g. `[0, 1, 0]` for the top).
     ///
@@ -49,16 +55,20 @@ pub struct World {
     dirty: HashSet<ChunkPos>,
     /// The chunk the world is currently centred on.
     center: ChunkPos,
+    /// The procedural generator that fills each newly loaded chunk.
+    terrain: Terrain,
 }
 
 impl World {
-    /// An empty world. Call [`World::update`] to stream in the first chunks.
-    pub fn new() -> Self {
+    /// An empty world generated from `seed`. Call [`World::update`] to stream in
+    /// the first chunks.
+    pub fn new(seed: u32) -> Self {
         Self {
             chunks: HashMap::new(),
             dirty: HashSet::new(),
             // `i32::MIN` can never be a real chunk, so the first update always runs.
             center: (i32::MIN, i32::MIN),
+            terrain: Terrain::new(seed),
         }
     }
 
@@ -105,7 +115,9 @@ impl World {
                 if self.chunks.contains_key(&pos) {
                     continue;
                 }
-                self.chunks.insert(pos, Chunk::superflat());
+                let mut chunk = self.terrain.generate_chunk(pos);
+                chunk.relight();
+                self.chunks.insert(pos, chunk);
                 self.dirty.insert(pos);
                 for n in neighbours(pos) {
                     if in_range(n.0, n.1) {
@@ -174,6 +186,32 @@ impl World {
         )
     }
 
+    /// The sky light level (0–15) at world `(wx, wy, wz)`.
+    ///
+    /// Unloaded cells read full daylight ([`light::MAX`]): light does not cross
+    /// chunk borders, so assuming the outside is lit keeps the world's edge bright
+    /// rather than ringed in black.
+    pub fn light(&self, wx: i32, wy: i32, wz: i32) -> u8 {
+        if wy < 0 {
+            return 0;
+        }
+        if wy >= chunk::HEIGHT as i32 {
+            return light::MAX;
+        }
+        let pos = (
+            wx.div_euclid(chunk::WIDTH as i32),
+            wz.div_euclid(chunk::DEPTH as i32),
+        );
+        match self.chunks.get(&pos) {
+            Some(chunk) => chunk.light(
+                wx.rem_euclid(chunk::WIDTH as i32),
+                wy,
+                wz.rem_euclid(chunk::DEPTH as i32),
+            ),
+            None => light::MAX,
+        }
+    }
+
     /// Set the block at world-space `(wx, wy, wz)`, marking the affected chunk(s)
     /// for re-meshing.
     ///
@@ -195,6 +233,8 @@ impl World {
                 return;
             };
             chunk.set(lx, wy as usize, lz, block);
+            // The edit opens up or shadows the blocks around it, so redo the light.
+            chunk.relight();
         }
         self.dirty.insert(pos);
 
@@ -212,8 +252,11 @@ impl World {
         }
     }
 
-    /// Cast a ray through the voxel grid and return the first solid block it hits
-    /// within `max_distance`, along with the face it was entered through.
+    /// Cast a ray through the voxel grid and return the first **opaque** block it
+    /// hits within `max_distance`, along with the face it was entered through.
+    ///
+    /// Water is see-through, so the ray passes straight through it and lands on the
+    /// ground beneath.
     ///
     /// Uses the Amanatides–Woo grid-traversal (a "DDA"): it walks from voxel to
     /// voxel along the ray rather than sampling at fixed steps, so it never skips
@@ -262,7 +305,7 @@ impl World {
         let mut normal = [0, 0, 0];
         let mut distance = 0.0;
         while distance <= max_distance {
-            if self.block(voxel[0], voxel[1], voxel[2]).is_solid() {
+            if self.block(voxel[0], voxel[1], voxel[2]).is_opaque() {
                 return Some(RayHit {
                     block: voxel,
                     normal,
@@ -294,11 +337,18 @@ impl World {
     pub fn loaded_count(&self) -> usize {
         self.chunks.len()
     }
+
+    /// The `y` of the topmost solid block at world `(x, z)`, whether or not that
+    /// chunk happens to be loaded.
+    pub fn surface_height(&self, x: i32, z: i32) -> i32 {
+        self.terrain.surface(x, z)
+    }
 }
 
 impl Default for World {
+    /// A world with the default terrain [`DEFAULT_SEED`].
     fn default() -> Self {
-        Self::new()
+        Self::new(DEFAULT_SEED)
     }
 }
 
@@ -330,7 +380,7 @@ mod tests {
 
     #[test]
     fn loads_a_square_patch() {
-        let mut world = World::new();
+        let mut world = World::new(DEFAULT_SEED);
         world.update(0.0, 0.0);
         let side = (2 * RENDER_RADIUS + 1) as usize;
         assert_eq!(world.loaded_count(), side * side);
@@ -338,7 +388,7 @@ mod tests {
 
     #[test]
     fn moving_replaces_far_chunks_with_near_ones() {
-        let mut world = World::new();
+        let mut world = World::new(DEFAULT_SEED);
         world.update(0.0, 0.0);
         let before = world.loaded_count();
 
@@ -358,7 +408,7 @@ mod tests {
 
     #[test]
     fn streamed_chunks_are_marked_dirty() {
-        let mut world = World::new();
+        let mut world = World::new(DEFAULT_SEED);
         world.update(0.0, 0.0);
         // Drain the initial load.
         world.take_dirty(usize::MAX);
@@ -374,35 +424,56 @@ mod tests {
 
     #[test]
     fn block_lookups_respect_chunk_boundaries() {
-        let mut world = World::new();
+        let mut world = World::new(DEFAULT_SEED);
         world.update(0.0, 0.0);
-        // Inside a loaded chunk: grass on top (y = 65), bedrock bottom.
-        assert_eq!(world.block(0, 65, 0), Block::Grass);
+        // Inside a loaded chunk: the surface block on top, bedrock at the bottom.
+        // Grass above the waterline, bare dirt where the ground is under the sea.
+        let top = world.surface_height(0, 0);
+        let cap = if top < SEA_LEVEL {
+            Block::Dirt
+        } else {
+            Block::Grass
+        };
+        assert_eq!(world.block(0, top, 0), cap);
         assert_eq!(world.block(0, 0, 0), Block::Bedrock);
-        assert_eq!(world.block(0, 66, 0), Block::Air);
+        // Above the ground it is air — or sea water, when the ground is low.
+        let above = if top < SEA_LEVEL {
+            Block::Water
+        } else {
+            Block::Air
+        };
+        assert_eq!(world.block(0, top + 1, 0), above);
         // Negative coordinates land in the chunk to the west, not the wrong one.
-        assert_eq!(world.block(-1, 65, -1), Block::Grass);
+        let west = world.surface_height(-1, -1);
+        let west_cap = if west < SEA_LEVEL {
+            Block::Dirt
+        } else {
+            Block::Grass
+        };
+        assert_eq!(world.block(-1, west, -1), west_cap);
     }
 
     #[test]
-    fn raycast_finds_the_first_solid_block() {
-        let mut world = World::new();
+    fn raycast_finds_the_first_opaque_block() {
+        let mut world = World::new(DEFAULT_SEED);
         world.update(0.0, 0.0);
 
-        // Looking straight down from above the surface (grass tops at y = 65),
-        // entering the top face.
+        // Looking straight down from above, entering the top face. Any sea in the
+        // way is see-through, so the ray lands on the ground beneath it.
+        let top = world.surface_height(0, 0);
+        let above = (top + 5) as f32 + 0.5;
         let hit = world
-            .raycast(Vec3::new(0.5, 70.0, 0.5), Vec3::new(0.0, -1.0, 0.0), 10.0)
+            .raycast(Vec3::new(0.5, above, 0.5), Vec3::new(0.0, -1.0, 0.0), 10.0)
             .expect("should hit the ground");
-        assert_eq!(hit.block, [0, 65, 0]);
+        assert_eq!(hit.block, [0, top, 0]);
         assert_eq!(hit.normal, [0, 1, 0], "entered through the top face");
 
         // Looking straight up hits nothing.
         assert_eq!(
-            world.raycast(Vec3::new(0.5, 70.0, 0.5), Vec3::new(0.0, 1.0, 0.0), 10.0),
+            world.raycast(Vec3::new(0.5, above, 0.5), Vec3::new(0.0, 1.0, 0.0), 10.0),
             None
         );
-        // Something too far away is out of reach.
+        // Something too far away is out of reach (terrain never reaches y = 200).
         assert_eq!(
             world.raycast(Vec3::new(0.5, 200.0, 0.5), Vec3::new(0.0, -1.0, 0.0), 10.0),
             None
@@ -411,13 +482,14 @@ mod tests {
 
     #[test]
     fn breaking_a_block_clears_it_and_marks_the_chunk_dirty() {
-        let mut world = World::new();
+        let mut world = World::new(DEFAULT_SEED);
         world.update(0.0, 0.0);
         world.take_dirty(usize::MAX);
 
-        world.set_block(1, 65, 1, Block::Air);
+        let top = world.surface_height(1, 1);
+        world.set_block(1, top, 1, Block::Air);
 
-        assert_eq!(world.block(1, 65, 1), Block::Air);
+        assert_eq!(world.block(1, top, 1), Block::Air);
         // An interior block only dirties its own chunk.
         assert_eq!(world.take_dirty(usize::MAX), vec![(0, 0)]);
     }

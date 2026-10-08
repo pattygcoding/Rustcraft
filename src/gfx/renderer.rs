@@ -6,9 +6,11 @@
 //! meshes for newly streamed chunks and drops meshes for unloaded ones.
 //!
 //! Every block texture lives in one [`super::texture::TextureArray`], so all block
-//! types share a single bind group and draw call. Opaque geometry is drawn first
-//! (depth writes on), then blended geometry (depth writes off) — see
-//! [`Renderer::render`].
+//! types share a single bind group and draw call. Each chunk's mesh is split in two
+//! (see [`super::mesh::MeshData`]): **opaque** geometry is drawn first — nearest
+//! chunk first, so hidden fragments are rejected early — with depth writes on, then
+//! **translucent** geometry (water) farthest chunk first, blended with depth writes
+//! off. See [`Renderer::render`].
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -20,7 +22,7 @@ use super::mesh::{Mesh, Vertex};
 use super::texture::BlockTextures;
 use crate::camera::Camera;
 use crate::hotbar::Hotbar;
-use crate::world::{World, mesh_chunk};
+use crate::world::{CHUNK_SIZE, World, mesh_chunk};
 
 /// Background colour used to clear each frame (a daytime sky blue).
 const CLEAR_COLOR: wgpu::Color = wgpu::Color {
@@ -59,6 +61,9 @@ pub struct Renderer {
     hud_key: Option<(usize, u32, u32)>,
     /// One mesh per loaded chunk, keyed by chunk coordinate.
     chunk_meshes: HashMap<(i32, i32), Mesh>,
+    /// This frame's chunk draw order, nearest first. Reused between frames so
+    /// ordering does not allocate.
+    draw_order: Vec<((i32, i32), f32)>,
     /// The block texture array; also used to mesh streamed chunks.
     textures: BlockTextures,
     /// Uniform buffer holding the [`Globals`] for the current frame.
@@ -216,6 +221,7 @@ impl Renderer {
             hud_mesh: None,
             hud_key: None,
             chunk_meshes: HashMap::new(),
+            draw_order: Vec::new(),
             textures,
             globals,
             bind_group,
@@ -257,6 +263,28 @@ impl Renderer {
         }
     }
 
+    /// Order the loaded chunks by distance from `camera`, nearest first.
+    ///
+    /// The opaque pass walks this list forwards — drawing near geometry first lets
+    /// the depth buffer reject hidden fragments as early as possible — and the
+    /// blended pass walks it backwards, because translucent surfaces have to be
+    /// drawn far to near. One distance sort serves both.
+    fn order_chunks(&mut self, camera: &Camera) {
+        self.draw_order.clear();
+        let (cx, cz) = (camera.position.x, camera.position.z);
+        self.draw_order
+            .extend(self.chunk_meshes.keys().map(|&(x, z)| {
+                // Squared distance from the camera to the chunk's centre; ordering
+                // does not need the square root.
+                let centre = CHUNK_SIZE as f32 * 0.5;
+                let dx = x as f32 * CHUNK_SIZE as f32 + centre - cx;
+                let dz = z as f32 * CHUNK_SIZE as f32 + centre - cz;
+                ((x, z), dx * dx + dz * dz)
+            }));
+        self.draw_order
+            .sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    }
+
     /// Handle a window resize.
     pub fn resize(&mut self, width: u32, height: u32) {
         self.context.resize(width, height);
@@ -265,10 +293,11 @@ impl Renderer {
         self.depth_view = create_depth_view(self.context.device(), config.width, config.height);
     }
 
-    /// Render one frame from `camera`: clear, draw opaque then transparent world
-    /// geometry, then the `hotbar` HUD on top.
+    /// Render one frame from `camera`: clear, draw the world's opaque geometry then
+    /// its translucent geometry, then the `hotbar` HUD on top.
     pub fn render(&mut self, camera: &Camera, hotbar: &Hotbar) {
         self.ensure_hud(hotbar);
+        self.order_chunks(camera);
 
         // The scene is in world space, so its model matrix is the identity and
         // the MVP is just the camera's view-projection.
@@ -333,16 +362,23 @@ impl Renderer {
 
             pass.set_bind_group(0, &self.bind_group, &[]);
 
-            // Opaque / cutout geometry first, writing depth...
+            // Opaque / cutout geometry first, writing depth — nearest chunks first so
+            // the depth buffer rejects hidden fragments as early as it can.
             pass.set_pipeline(&self.opaque_pipeline);
-            for mesh in self.chunk_meshes.values() {
-                mesh.draw_opaque(&mut pass);
+            for &(pos, _) in &self.draw_order {
+                if let Some(mesh) = self.chunk_meshes.get(&pos) {
+                    mesh.draw_opaque(&mut pass);
+                }
             }
 
-            // ...then blended geometry, which tests but does not write depth.
+            // Then blended geometry. It tests depth but does not write it, so it must
+            // run back to front — here that means walking the near-to-far order
+            // backwards — for nearer water to blend over the water behind it.
             pass.set_pipeline(&self.transparent_pipeline);
-            for mesh in self.chunk_meshes.values() {
-                mesh.draw_transparent(&mut pass);
+            for &(pos, _) in self.draw_order.iter().rev() {
+                if let Some(mesh) = self.chunk_meshes.get(&pos) {
+                    mesh.draw_translucent(&mut pass);
+                }
             }
 
             // Finally the hotbar HUD, drawn on top in screen space.

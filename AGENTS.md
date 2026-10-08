@@ -13,16 +13,21 @@ the rendering, world and physics code rather than pulling in a full game engine.
 
 ## Current status
 
-**Infinite world you can edit.** A superflat world (1 bedrock, 59 stone, 5 dirt, 1
-grass, 66 blocks tall) **streams around the player**: only chunks within
-`RENDER_RADIUS` are kept loaded; as the player moves, far chunks are dropped and
-near ones generated, so the world extends forever while memory stays bounded.
-Chunks are meshed with **cross-chunk hidden-face culling** into one mesh (one draw
-call) each, drawn from individual PNGs in a `texture_2d_array` (no atlas). A
-first-person fly camera; **right-click breaks** and **left-click places** the block
-the camera is looking at (a voxel raycast), chosen from a **hotbar HUD** you scroll
-through. See **Textures & blocks** and **Chunks & meshing**. Next: greedy meshing,
-noise terrain, physics.
+**Infinite world you can edit.** A **noise-generated** landscape — rolling hills,
+cliffs, the odd overhang, and **translucent oceans** flooded up to `SEA_LEVEL`
+(y = 62) — from a
+3D density field of combined multi-octave Perlin noise (bedrock → stone → dirt →
+grass) **streams around the player**: only
+chunks within `RENDER_RADIUS` are kept loaded; as the player moves, far chunks are
+dropped and near ones generated, so the world extends forever while memory stays
+bounded. Chunks are meshed with **cross-chunk hidden-face culling** into one mesh
+(one draw call) each, drawn from individual PNGs in a `texture_2d_array` (no atlas).
+A first-person fly camera; **right-click breaks** and **left-click places** the
+block the camera is looking at (a voxel raycast), chosen from a **hotbar HUD** you
+scroll through. **Minecraft-style sky lighting (levels 0–15)** darkens overhangs and
+caves, and shades each face by which way it points. See **Textures & blocks** (incl.
+**Lighting** and **Transparency**), **Terrain** and **Chunks & meshing**. Next:
+greedy meshing, player physics, biomes.
 
 ## Tech stack
 
@@ -52,13 +57,15 @@ src/
     mod.rs         Graphics module root + re-exports.
     context.rs     `GraphicsContext`: wgpu instance/device/queue/surface + resize.
     renderer.rs    `Renderer`: pipelines, uniform, depth buffer, draws the scene.
-    mesh.rs        `Vertex` + `BlockFaces` + `Mesh` (textured block geometry).
+    mesh.rs        `Vertex`, `BlockFaces`, `MeshData`/`Mesh` (opaque + translucent).
     texture.rs     `TextureArray` + `BlockTextures` (one PNG per array layer).
   input.rs         `Input`: keyboard/mouse state -> per-frame `PlayerInput`.
   world/
     mod.rs         `World`: streaming set of loaded chunks + world-space lookups.
     block.rs       `Block` types and their per-face textures.
-    chunk.rs       16×256×16 `Chunk` storage + simple terrain generation.
+    chunk.rs       16×256×16 `Chunk`: blocks, plus 0–15 sky light per cell.
+    light.rs       `sky_light`: sunlight columns + a flood-fill spread.
+    terrain.rs     `Terrain`: 3D `Fbm<Perlin>` density field + chunk generation.
     mesher.rs      `mesh_chunk`: emits only visible faces (hidden-face culling).
 shaders/
   block.wgsl       Textured-block vertex + fragment shader.
@@ -107,14 +114,19 @@ Rules of the road:
   `BlockFaces::uniform(l)` (all six faces), `BlockFaces::column(top, side, bottom)`
   (grass), or `BlockFaces::new([+X, -X, +Y, -Y, +Z, -Z])` for anything else. Face
   order is `[+X, -X, +Y, -Y, +Z, -Z]`; each vertex carries a `layer` index that the
-  shader samples.
+  shader samples, plus the packed lighting for that face (see **Lighting** below).
+* **Greyscale textures** (water): do not bake the colour into the image. Give the
+  block a colour in `Block::tint()` (`0xAARRGGBB`); the mesher writes it per vertex
+  and the shader multiplies it over the sample. Water uses Minecraft's blue
+  `0x3F76E4` with a translucent alpha; untinted blocks send opaque white, which
+  leaves the texture alone.
 * **Cutout blocks** (leaves, foliage, fences): the fragment shader `discard`s
   fragments with alpha < 0.5, so transparent texels vanish in the opaque pass with
   no blending.
-* **Blended blocks** (glass, water): build them with
-  `PlacedBlock { transparent: true, .. }`. They go into a second index range drawn
-  after the opaque pass with alpha blending and depth writes off (see
-  `renderer::render` and `create_pipeline`).
+* **Blended blocks** (water): report them from `Block::is_translucent()`, and the
+  mesher puts their faces in the **translucent** set instead of the opaque one. The
+  renderer draws that set after the opaque geometry, farthest chunk first, with
+  alpha blending and depth writes off — see **Transparency** below.
 * **Animated blocks**: call `TextureArray::update_layer(queue, layer, image)` each
   frame (or every few frames) for just that layer — far cheaper than an atlas.
 
@@ -124,8 +136,78 @@ Current limits / next steps:
   layers do not bleed.
 * Transparent geometry is not yet sorted back-to-front (fine for convex blocks
   like glass; matters for e.g. stacked water).
-* The transparent pipeline needs at least one `transparent: true` block in the
-  scene to actually draw a second pass.
+* The transparent pipeline needs at least one translucent block in the scene to
+  actually draw a second pass (water supplies that).
+
+### Lighting
+
+Light lives in the chunk (`Chunk::light`, one `u8` per cell) and is recomputed by
+`world::light` whenever a chunk is generated or a block is edited. It follows
+Minecraft's rules, at **levels 0–15**:
+
+* **Sunlight** falls straight down at full strength, so every cell with open sky
+  above it is **15**.
+* From there light spreads one block at a time in all six directions, **losing a
+  level each step**, and solid blocks stop it dead.
+* So the world is bright in the open and fades to black under overhangs and deep
+  inside caves. (Light does not cross chunk borders; sunlight is vertical, so all
+  that is lost is the sideways bleed where a shadow straddles a border.)
+
+The mesher bakes, per face, the light of the open cell that face looks into, plus
+the face index — packed into one `u32` by `mesh::pack_light` (sky light in bits 0–3,
+block light 4–7, face 8–10; both channels are 0–15). The fragment shader then:
+
+1. takes `max(sky_light, block_light)` for that cell — block light is 0 for now,
+   since nothing emits light yet, and it is always daytime so there is no day/night
+   scaling;
+2. runs it through **Minecraft's lightmap curve** (`15 → 1.0`, `8 → 0.22`, `0 → 0`),
+   so shadow deepens quickly with distance from the sky;
+3. multiplies by a **per-face shade** — **top 1.0, north/south 0.8, east/west 0.6,
+   bottom 0.5**. That is the trick that makes a block's sides read as solid: without
+   it every face of a flat-coloured cube looks identical.
+
+The multiply happens in linear space (textures and the render target are sRGB), so
+the shader raises the factor to `2.2` to land the shading on the gamma-encoded
+texture the way Minecraft does, and floors it so unlit caves are very dark grey
+rather than pure black.
+
+Known limits: lighting is per **face**, not per vertex corner, so there is no
+smooth/ambient-occlusion darkening in corners yet; and nothing emits block light.
+
+### Transparency
+
+Water is **translucent**, so it cannot be drawn in the opaque pass. Each chunk's
+mesh is therefore split in two (`gfx::mesh::MeshData`): an **opaque** set
+(depth-writing, unblended) and a **translucent** set (blended, depth writes off).
+They are separate vertex *and* index buffers, so each pass binds exactly what it
+needs with no index offsets to reason about, and a chunk with no water allocates
+nothing for the blended pass.
+
+The renderer draws them in the only order that is correct:
+
+1. **Opaque geometry**, nearest chunk first, depth writes on. Front-to-back is an
+   optimisation: the depth buffer then rejects hidden fragments as early as it can.
+2. **Translucent geometry**, farthest chunk first, blended, testing depth but not
+   writing it. Depth writes must stay off — a translucent surface must not hide
+   what is blended behind it — which is exactly why the order has to be back to
+   front: nearer water blends *over* the water behind it.
+
+`Renderer::order_chunks` sorts the loaded chunks by distance once per frame into a
+reused `Vec` (no per-frame allocation); the opaque pass walks it forwards and the
+blended pass walks it backwards, so one sort serves both.
+
+Face culling follows the same split (`Block::hides_face_of`): an opaque neighbour
+hides a face, a translucent one hides only faces of its own kind. So the sea has no
+faces between its own cells, while the seabed *is* drawn — and seen — through the
+water.
+
+Water is also see-through to gameplay: `World::raycast` stops at the first **opaque**
+block, so looking at the sea targets the ground beneath it and blocks can be placed
+into water.
+
+Still to come: an underwater fog/overlay (`water_overlay.png`), and sorting the
+translucent *faces within* a chunk — with one flat sea at `SEA_LEVEL` at most one
+translucent surface lies along any view ray, so chunk ordering is enough for now.
 
 ## Chunks & meshing
 
@@ -146,12 +228,54 @@ Meshing (`world::mesher::mesh_chunk`) is where the efficiency comes from:
 * A whole chunk becomes **one mesh and one draw call**, so per-frame cost is
   independent of how many blocks the chunk holds.
 
-`Chunk::superflat()` places 1 bedrock, 59 stone, 5 dirt and 1 grass (66 blocks
-tall). `World` keeps a `HashMap<ChunkPos, Chunk>` of the chunks near the player;
-`World::update(player_x, player_z)` streams them — dropping out-of-range chunks,
-generating in-range ones — and marks a **dirty set** of chunks that need
-(re)meshing. Because a chunk's mesh depends on whether its *neighbours* are loaded
-(culling), both generated chunks and their neighbours are marked dirty.
+`Terrain::generate_chunk` fills each column: bedrock at the bottom, stone, a few
+blocks of dirt, then grass on top. `World` keeps a `HashMap<ChunkPos, Chunk>` of
+the chunks near the player; `World::update(player_x, player_z)` streams them —
+dropping out-of-range chunks, generating in-range ones — and marks a **dirty set**
+of chunks that need (re)meshing. Because a chunk's mesh depends on whether its
+*neighbours* are loaded (culling), both generated chunks and their neighbours are
+marked dirty.
+
+### Terrain
+
+`src/world/terrain.rs` shapes the land the way modern Minecraft does: as a **3D
+noise field**, not a heightmap. Each point gets a *density*, and a block is solid
+where it is positive:
+
+    density(x, y, z) = (surface_target(x, z) - y) + DETAIL * noise_at(x, y, z)
+
+* `surface_target` is a 2D field: a low-frequency **continent** layer (wavelength
+  ~180 blocks) scaled by a **relief** layer, so the world has open plains and
+  mountain ranges.
+* `noise_at` is the **combined multi-octave 3D Perlin** field in **`[-1, 1]`** — two
+  `Fbm<Perlin>` layers (a coarse *rough* one and a finer *detail* one) blended with
+  weights that sum to 1. Its `y` is stretched (`Y_STRETCH`) so it varies faster
+  vertically than horizontally; that vertical variation is what grows **overhangs,
+  cliffs and caves** rather than a smooth sheet (~3% of columns end up with air
+  pocketed beneath their surface).
+* `DETAIL` (±35 blocks) is how far the 3D noise can push the surface.
+
+`(surface_target - y)` falls by one per block going up, so more than `WINDOW` blocks
+either side of the target the answer is certain — solid below, air above — and only
+that narrow band is ever sampled. Within it the field is read every `STEP` (4) blocks
+down the column and **linearly interpolated** in between, exactly like Minecraft's
+density noise. Sampling is the current hot spot (~2 s for the initial 169 chunks in
+a debug build); background-thread generation is on the roadmap.
+
+Everything is a pure function of `(seed, x, y, z)`, so chunks agree at their borders
+and the world is reproducible. The seed comes from `RUSTCRAFT_SEED`, or `DEFAULT_SEED`
+if unset. The camera spawns standing on the surface.
+
+### Water
+
+`SEA_LEVEL` is **62**: once a column's ground is laid down, any open space left
+between it and the sea is filled with `Block::Water`, and the surface block is
+**grass above the waterline but bare dirt below it** — a drowned lawn would look
+wrong. Only the space *above* a column's surface floods, so the noise's caves stay
+dry. The camera stands on the sea when its spawn column is under it.
+
+Note the numbers: `BASE_HEIGHT` is 64 and `SEA_LEVEL` is 62, so a little under half
+the world ends up as ocean. Both are single constants to taste.
 
 ### Chunk streaming
 
@@ -323,17 +447,24 @@ Work milestones in order; update the **Current status** section as they land.
 3. **Chunks** — 16×256×16 chunks, a hidden-face-culling mesher that also culls
    across chunk borders, and a 16×16 grid forming a 256×256 world. ✅ done (greedy
    meshing + streaming still to come).
-4. **Terrain** — fill chunks from `noise` (e.g. fBm) to get rolling hills.
+4. **Terrain** — ✅ a 3D density field of combined multi-octave `Fbm<Perlin>` noise
+   (blended layers, linearly interpolated down each column, like Minecraft), giving
+   hills, cliffs and overhangs, plus **oceans filled to `SEA_LEVEL`** and drawn
+   translucently (see **Transparency**). Still to come: biomes and flowing water.
 5. **Blocks & textures** — ✅ individual PNGs in a `texture_2d_array` (no atlas),
    per-face textures, cutout + transparent passes. Remaining: animated textures,
    then greedy meshing (which lands with chunks).
-6. **Player** — WASD + mouse-look, gravity and AABB collision, jumping.
-7. **Interaction** — ✅ voxel raycast break (right-click) and place (left-click),
+6. **Lighting** — ✅ Minecraft-style sky light at levels 0–15 (vertical sunlight +
+   a flood-fill spread), baked per face along with Minecraft's directional face
+   shading. Still to come: block light from torches, cross-chunk propagation, and
+   smooth per-vertex ambient occlusion.
+7. **Player** — WASD + mouse-look, gravity and AABB collision, jumping.
+8. **Interaction** — ✅ voxel raycast break (right-click) and place (left-click),
    with a scrollable hotbar HUD; affected chunks re-mesh automatically.
-8. **Streaming** — ✅ chunks stream around the player (load/unload with a per-frame
+9. **Streaming** — ✅ chunks stream around the player (load/unload with a per-frame
    mesh budget, nearest first). Still to come: generating/meshing on background
    threads.
-9. **Persistence** — save/load the world (e.g. a simple binary or region format).
+10. **Persistence** — save/load the world (e.g. a simple binary or region format).
 
 ## Notes on running
 

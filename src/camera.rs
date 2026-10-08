@@ -42,8 +42,9 @@ pub struct Camera {
 
 impl Default for Camera {
     fn default() -> Self {
-        // Stand just above the surface (grass tops at y = 65), looking forward and
-        // slightly down, so there is a block within reach to break straight away.
+        // Spawn near the world origin, looking forward and slightly down. The `y`
+        // here is only a placeholder: once the world exists the game stands the
+        // camera on the terrain surface at this `x`/`z` (see `App::resumed`).
         let mut camera = Self::new(Vec3::new(8.0, 67.0, 8.0));
         camera.pitch = -0.35;
         camera

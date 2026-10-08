@@ -13,6 +13,9 @@ const VOLUME: usize = WIDTH * HEIGHT * DEPTH;
 /// A vertical column of blocks, indexed `[y][z][x]`.
 pub struct Chunk {
     blocks: Vec<Block>,
+    /// Sky light level (0–15) per cell, `[y][z][x]` like `blocks`; see
+    /// [`Chunk::relight`].
+    light: Vec<u8>,
     /// One past the highest non-air block; lets meshing skip the empty space above.
     height: usize,
 }
@@ -22,6 +25,7 @@ impl Chunk {
     pub fn new() -> Self {
         Self {
             blocks: vec![Block::Air; VOLUME],
+            light: vec![0; VOLUME],
             height: 0,
         }
     }
@@ -51,22 +55,21 @@ impl Chunk {
         self.height
     }
 
-    /// A superflat chunk: 1 bedrock, 59 stone, 5 dirt, then grass on top (y = 65).
-    pub fn superflat() -> Self {
-        let mut chunk = Self::new();
-        for z in 0..DEPTH {
-            for x in 0..WIDTH {
-                chunk.set(x, 0, z, Block::Bedrock);
-                for y in 1..60 {
-                    chunk.set(x, y, z, Block::Stone);
-                }
-                for y in 60..65 {
-                    chunk.set(x, y, z, Block::Dirt);
-                }
-                chunk.set(x, 65, z, Block::Grass);
-            }
+    /// The sky light level (0–15) at `(x, y, z)`, or `0` outside the chunk.
+    pub fn light(&self, x: i32, y: i32, z: i32) -> u8 {
+        if x < 0 || y < 0 || z < 0 || x >= WIDTH as i32 || y >= HEIGHT as i32 || z >= DEPTH as i32 {
+            return 0;
         }
-        chunk
+        self.light[index(x as usize, y as usize, z as usize)]
+    }
+
+    /// Recompute this chunk's sky light from its blocks.
+    ///
+    /// Call this after generating the chunk, and after any edit: digging a hole
+    /// lets light in, and placing a block casts a shadow.
+    pub fn relight(&mut self) {
+        let light = super::light::sky_light(self);
+        self.light = light;
     }
 }
 
