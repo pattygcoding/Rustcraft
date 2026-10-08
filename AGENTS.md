@@ -13,13 +13,16 @@ the rendering, world and physics code rather than pulling in a full game engine.
 
 ## Current status
 
-**Superflat world.** A 256×256 block superflat world (16×16 chunks, centred on the
-origin, 66 blocks tall): 1 bedrock, 59 stone, 5 dirt, 1 grass. It is meshed with
-**hidden-face culling that also spans chunk borders**, into one mesh per chunk,
-and drawn from individual PNGs in a `texture_2d_array` (no atlas). 256 chunks →
-256 draw calls for ~199k visible faces. Viewed through a first-person fly camera
-(`src/camera.rs`). See **Textures & blocks** and **Chunks & meshing**. Next: block
-interaction, greedy meshing, noise terrain.
+**Infinite world you can edit.** A superflat world (1 bedrock, 59 stone, 5 dirt, 1
+grass, 66 blocks tall) **streams around the player**: only chunks within
+`RENDER_RADIUS` are kept loaded; as the player moves, far chunks are dropped and
+near ones generated, so the world extends forever while memory stays bounded.
+Chunks are meshed with **cross-chunk hidden-face culling** into one mesh (one draw
+call) each, drawn from individual PNGs in a `texture_2d_array` (no atlas). A
+first-person fly camera; **right-click breaks** and **left-click places** the block
+the camera is looking at (a voxel raycast), chosen from a **hotbar HUD** you scroll
+through. See **Textures & blocks** and **Chunks & meshing**. Next: greedy meshing,
+noise terrain, physics.
 
 ## Tech stack
 
@@ -44,6 +47,7 @@ direct control over the pipeline. Revisit only if the scope grows enormously.
 src/
   main.rs          Entry point: logging, `winit` event loop, the `App` handler.
   camera.rs        `Camera`: first-person fly camera (view/projection matrices).
+  hotbar.rs        `Hotbar`: placeable blocks + selection (+ HUD geometry).
   gfx/
     mod.rs         Graphics module root + re-exports.
     context.rs     `GraphicsContext`: wgpu instance/device/queue/surface + resize.
@@ -52,12 +56,13 @@ src/
     texture.rs     `TextureArray` + `BlockTextures` (one PNG per array layer).
   input.rs         `Input`: keyboard/mouse state -> per-frame `PlayerInput`.
   world/
-    mod.rs         World module root + re-exports.
+    mod.rs         `World`: streaming set of loaded chunks + world-space lookups.
     block.rs       `Block` types and their per-face textures.
     chunk.rs       16×256×16 `Chunk` storage + simple terrain generation.
     mesher.rs      `mesh_chunk`: emits only visible faces (hidden-face culling).
 shaders/
   block.wgsl       Textured-block vertex + fragment shader.
+  ui.wgsl          Screen-space HUD shader (the hotbar).
 resources/
   assets/textures/ Individual block PNGs (one array layer each).
 Cargo.toml         Dependencies (edition 2024).
@@ -133,20 +138,30 @@ Meshing (`world::mesher::mesh_chunk`) is where the efficiency comes from:
 * For every solid block and each of its six faces, the face is emitted **only if
   the neighbouring block is not solid** (`Block::is_solid`). Interior faces — the
   majority in a filled chunk — produce no vertices, indices or triangles at all.
-  (The current world meshes to ~199k visible faces across 256 chunks, vs. ~26M
-  faces if every one of its ~4.3M solid blocks drew all six.)
+  (The loaded region meshes to roughly ~140k visible faces across ~169 chunks,
+  vs. millions if every block face were drawn.)
 * Neighbour lookups cross chunk borders via `World::block`, so faces shared by two
   chunks are culled too — only the world's outer shell is drawn. An isolated chunk
   reads air at its border and so draws its whole shell.
 * A whole chunk becomes **one mesh and one draw call**, so per-frame cost is
   independent of how many blocks the chunk holds.
 
-`World::superflat()` builds the world as `CHUNKS_PER_AXIS²` (16×16 = 256) chunks,
-centred on the origin; each `Chunk::superflat()` places 1 bedrock, 59 stone, 5 dirt
-and 1 grass (66 blocks tall). `World::block()` samples any world position so the
-mesher can cull across chunk borders, and `World::iter_chunks()` yields each
-chunk's world-space origin, which the mesher bakes into vertex positions — so all
-chunks share one view-projection uniform and no per-chunk model matrix.
+`Chunk::superflat()` places 1 bedrock, 59 stone, 5 dirt and 1 grass (66 blocks
+tall). `World` keeps a `HashMap<ChunkPos, Chunk>` of the chunks near the player;
+`World::update(player_x, player_z)` streams them — dropping out-of-range chunks,
+generating in-range ones — and marks a **dirty set** of chunks that need
+(re)meshing. Because a chunk's mesh depends on whether its *neighbours* are loaded
+(culling), both generated chunks and their neighbours are marked dirty.
+
+### Chunk streaming
+
+`World::update` is called every frame but only does work when the player crosses a
+chunk boundary. `Renderer::update_chunks` drops meshes for unloaded chunks and
+(re)meshes up to `MESH_BUDGET` dirty chunks **per frame, nearest first**, so
+streaming never stalls a frame — far chunks are replaced by near ones a few at a
+time. `World::block()` samples any world position so the mesher culls across chunk
+borders, and the mesher bakes each chunk's world origin into its vertex positions,
+so all chunks share one view-projection uniform (no per-chunk model matrix).
 
 Still to come: dirty-chunk remeshing on edit, **greedy meshing** (merging coplanar
 quads — a flat grass field would collapse to a handful of quads), and meshing on
@@ -204,14 +219,27 @@ Notes:
 | `Space` ×2 (double-tap) | Toggle flight (faster movement) |
 | `Ctrl` | Sprint (speed multiplier) |
 | `Esc` | Release the cursor |
-| Left click | Grab the cursor again |
-| Left / right button | Break / place (captured, unused until implemented) |
-| Scroll wheel | Hotbar selection (captured, unused until implemented) |
+| Left click | Place the selected block (or grab the cursor when it is free) |
+| Right click | Break the block the camera is looking at |
+| Scroll wheel | Change the selected block in the hotbar |
 
 Held keys are tracked in a set and cleared when the window loses focus; mouse
 look uses raw `DeviceEvent::MouseMotion` so it keeps working while the cursor is
 grabbed; auto-repeat is ignored for double-tap detection. The cursor is grabbed
 on startup — `Esc` frees it, a left click grabs it again.
+
+**Block editing** raycasts from the camera through the voxel grid
+(`World::raycast`, an Amanatides–Woo DDA) up to `REACH` (6) blocks, returning the
+block hit *and* the face it was entered through. **Right-click breaks** it;
+**left-click places** the selected block in the empty cell against that face. Edits
+go through `World::set_block`, which marks the chunk — and any touched border
+neighbour — dirty for re-meshing. Bedrock is unbreakable, so you cannot mine
+through the bottom.
+
+**Hotbar**: `src/hotbar.rs` holds the placeable blocks and the selection; the mouse
+wheel changes it. The renderer draws it as a screen-space HUD (`shaders/ui.wgsl` —
+a 2D pipeline that reuses the block texture array and bind group), with the selected
+slot enlarged so you can see what you will place.
 
 `Space`/`Shift` currently map to **up/down** because there is no gravity or
 ground yet; once the player/physics milestone lands they become jump/sneak and
@@ -300,9 +328,11 @@ Work milestones in order; update the **Current status** section as they land.
    per-face textures, cutout + transparent passes. Remaining: animated textures,
    then greedy meshing (which lands with chunks).
 6. **Player** — WASD + mouse-look, gravity and AABB collision, jumping.
-7. **Interaction** — voxel raycast for break/place; rebuild affected chunk mesh.
-8. **Streaming** — generate/mesh chunks around the player on background threads;
-   unload distant chunks.
+7. **Interaction** — ✅ voxel raycast break (right-click) and place (left-click),
+   with a scrollable hotbar HUD; affected chunks re-mesh automatically.
+8. **Streaming** — ✅ chunks stream around the player (load/unload with a per-frame
+   mesh budget, nearest first). Still to come: generating/meshing on background
+   threads.
 9. **Persistence** — save/load the world (e.g. a simple binary or region format).
 
 ## Notes on running

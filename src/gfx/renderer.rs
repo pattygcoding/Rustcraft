@@ -19,6 +19,7 @@ use super::context::GraphicsContext;
 use super::mesh::{Mesh, Vertex};
 use super::texture::BlockTextures;
 use crate::camera::Camera;
+use crate::hotbar::Hotbar;
 use crate::world::{World, mesh_chunk};
 
 /// Background colour used to clear each frame (a daytime sky blue).
@@ -50,6 +51,12 @@ pub struct Renderer {
     opaque_pipeline: wgpu::RenderPipeline,
     /// Pipeline for blended geometry, drawn after the opaque pass.
     transparent_pipeline: wgpu::RenderPipeline,
+    /// Screen-space HUD pipeline (blended, no depth writes).
+    ui_pipeline: wgpu::RenderPipeline,
+    /// The hotbar HUD mesh, rebuilt when the selection or viewport changes.
+    hud_mesh: Option<Mesh>,
+    /// The `(selection, width, height)` the HUD mesh was built for.
+    hud_key: Option<(usize, u32, u32)>,
     /// One mesh per loaded chunk, keyed by chunk coordinate.
     chunk_meshes: HashMap<(i32, i32), Mesh>,
     /// The block texture array; also used to mesh streamed chunks.
@@ -161,10 +168,39 @@ impl Renderer {
                 });
 
         let format = context.config().format;
-        let opaque_pipeline =
-            create_pipeline(context.device(), &pipeline_layout, &shader, format, false);
-        let transparent_pipeline =
-            create_pipeline(context.device(), &pipeline_layout, &shader, format, true);
+        let opaque_pipeline = create_pipeline(
+            context.device(),
+            &pipeline_layout,
+            &shader,
+            format,
+            false,
+            "blocks-opaque",
+        );
+        let transparent_pipeline = create_pipeline(
+            context.device(),
+            &pipeline_layout,
+            &shader,
+            format,
+            true,
+            "blocks-transparent",
+        );
+
+        // The HUD reuses the same layout and bind group, but draws screen-space
+        // quads with a shader that skips the transform.
+        let ui_shader = context
+            .device()
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("ui-shader"),
+                source: wgpu::ShaderSource::Wgsl(include_str!("../../shaders/ui.wgsl").into()),
+            });
+        let ui_pipeline = create_pipeline(
+            context.device(),
+            &pipeline_layout,
+            &ui_shader,
+            format,
+            true,
+            "ui",
+        );
 
         let depth_view = create_depth_view(
             context.device(),
@@ -176,12 +212,30 @@ impl Renderer {
             context,
             opaque_pipeline,
             transparent_pipeline,
+            ui_pipeline,
+            hud_mesh: None,
+            hud_key: None,
             chunk_meshes: HashMap::new(),
             textures,
             globals,
             bind_group,
             depth_view,
         }
+    }
+
+    /// Rebuild the hotbar HUD mesh if the selection or the viewport changed.
+    fn ensure_hud(&mut self, hotbar: &Hotbar) {
+        let key = (
+            hotbar.selected_index(),
+            self.context.config().width,
+            self.context.config().height,
+        );
+        if self.hud_key == Some(key) {
+            return;
+        }
+        let data = hotbar.mesh_data(&self.textures, self.aspect());
+        self.hud_mesh = Some(Mesh::upload(self.context.device(), "hotbar", &data));
+        self.hud_key = Some(key);
     }
 
     /// Drop meshes for chunks that are no longer loaded, then (re)mesh a bounded
@@ -211,9 +265,11 @@ impl Renderer {
         self.depth_view = create_depth_view(self.context.device(), config.width, config.height);
     }
 
-    /// Render one frame from `camera`: clear, then draw opaque then transparent
-    /// geometry.
-    pub fn render(&mut self, camera: &Camera) {
+    /// Render one frame from `camera`: clear, draw opaque then transparent world
+    /// geometry, then the `hotbar` HUD on top.
+    pub fn render(&mut self, camera: &Camera, hotbar: &Hotbar) {
+        self.ensure_hud(hotbar);
+
         // The scene is in world space, so its model matrix is the identity and
         // the MVP is just the camera's view-projection.
         let globals = Globals {
@@ -288,6 +344,12 @@ impl Renderer {
             for mesh in self.chunk_meshes.values() {
                 mesh.draw_transparent(&mut pass);
             }
+
+            // Finally the hotbar HUD, drawn on top in screen space.
+            if let Some(hud) = &self.hud_mesh {
+                pass.set_pipeline(&self.ui_pipeline);
+                hud.draw_opaque(&mut pass);
+            }
         }
 
         self.context.queue().submit(Some(encoder.finish()));
@@ -313,13 +375,10 @@ fn create_pipeline(
     shader: &wgpu::ShaderModule,
     format: wgpu::TextureFormat,
     transparent: bool,
+    label: &str,
 ) -> wgpu::RenderPipeline {
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some(if transparent {
-            "blocks-transparent"
-        } else {
-            "blocks-opaque"
-        }),
+        label: Some(label),
         layout: Some(layout),
         vertex: wgpu::VertexState {
             module: shader,

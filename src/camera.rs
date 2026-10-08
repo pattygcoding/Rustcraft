@@ -42,9 +42,10 @@ pub struct Camera {
 
 impl Default for Camera {
     fn default() -> Self {
-        // A vantage overlooking the superflat world (which now streams around you).
-        let mut camera = Self::new(Vec3::new(0.0, 90.0, 80.0));
-        camera.pitch = -0.4;
+        // Stand just above the surface (grass tops at y = 65), looking forward and
+        // slightly down, so there is a block within reach to break straight away.
+        let mut camera = Self::new(Vec3::new(8.0, 67.0, 8.0));
+        camera.pitch = -0.35;
         camera
     }
 }

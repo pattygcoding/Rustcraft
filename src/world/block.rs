@@ -23,6 +23,14 @@ impl Block {
         !matches!(self, Block::Air)
     }
 
+    /// Whether the player can break this block.
+    ///
+    /// Bedrock is deliberately unbreakable, so you can't mine through the bottom
+    /// of the world.
+    pub fn is_breakable(self) -> bool {
+        !matches!(self, Block::Air | Block::Bedrock)
+    }
+
     /// Resolve this block's per-face texture layers from the loaded textures.
     ///
     /// Face order is `[+X, -X, +Y, -Y, +Z, -Z]`. Grass uses a different top

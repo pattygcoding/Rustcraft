@@ -16,8 +16,9 @@ mod mesher;
 
 use std::collections::{HashMap, HashSet};
 
-use block::Block;
+use glam::Vec3;
 
+pub use block::Block;
 pub use chunk::Chunk;
 pub use mesher::mesh_chunk;
 
@@ -27,6 +28,17 @@ pub const RENDER_RADIUS: i32 = 6;
 
 /// The position of a chunk, in chunk units.
 pub type ChunkPos = (i32, i32);
+
+/// A block hit by a [`World::raycast`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RayHit {
+    /// Coordinates of the solid block that was hit.
+    pub block: [i32; 3],
+    /// Unit axis of the face that was entered (e.g. `[0, 1, 0]` for the top).
+    ///
+    /// Add this to `block` to get the empty cell to place a new block into.
+    pub normal: [i32; 3],
+}
 
 /// The set of nearby chunks making up the world around the player.
 pub struct World {
@@ -162,6 +174,122 @@ impl World {
         )
     }
 
+    /// Set the block at world-space `(wx, wy, wz)`, marking the affected chunk(s)
+    /// for re-meshing.
+    ///
+    /// A block on a chunk border also touches the neighbouring chunk (its culling
+    /// changed there), so that neighbour is marked too.
+    pub fn set_block(&mut self, wx: i32, wy: i32, wz: i32, block: Block) {
+        if wy < 0 || wy >= chunk::HEIGHT as i32 {
+            return;
+        }
+        let pos = (
+            wx.div_euclid(chunk::WIDTH as i32),
+            wz.div_euclid(chunk::DEPTH as i32),
+        );
+        let lx = wx.rem_euclid(chunk::WIDTH as i32) as usize;
+        let lz = wz.rem_euclid(chunk::DEPTH as i32) as usize;
+
+        {
+            let Some(chunk) = self.chunks.get_mut(&pos) else {
+                return;
+            };
+            chunk.set(lx, wy as usize, lz, block);
+        }
+        self.dirty.insert(pos);
+
+        // Mark any neighbour that shares a border face with the edited block.
+        let border_neighbours = [
+            (lx == 0).then_some((pos.0 - 1, pos.1)),
+            (lx == chunk::WIDTH - 1).then_some((pos.0 + 1, pos.1)),
+            (lz == 0).then_some((pos.0, pos.1 - 1)),
+            (lz == chunk::DEPTH - 1).then_some((pos.0, pos.1 + 1)),
+        ];
+        for n in border_neighbours.into_iter().flatten() {
+            if self.chunks.contains_key(&n) {
+                self.dirty.insert(n);
+            }
+        }
+    }
+
+    /// Cast a ray through the voxel grid and return the first solid block it hits
+    /// within `max_distance`, along with the face it was entered through.
+    ///
+    /// Uses the Amanatides–Woo grid-traversal (a "DDA"): it walks from voxel to
+    /// voxel along the ray rather than sampling at fixed steps, so it never skips
+    /// a block however thin the angle.
+    pub fn raycast(&self, origin: Vec3, direction: Vec3, max_distance: f32) -> Option<RayHit> {
+        let dir = direction.normalize_or_zero();
+        if dir == Vec3::ZERO {
+            return None;
+        }
+
+        let mut voxel = [
+            origin.x.floor() as i32,
+            origin.y.floor() as i32,
+            origin.z.floor() as i32,
+        ];
+        let step = [
+            dir.x.signum() as i32,
+            dir.y.signum() as i32,
+            dir.z.signum() as i32,
+        ];
+        // Distance along the ray to cross one whole voxel on each axis.
+        let t_delta = [
+            if dir.x != 0.0 {
+                (1.0 / dir.x).abs()
+            } else {
+                f32::INFINITY
+            },
+            if dir.y != 0.0 {
+                (1.0 / dir.y).abs()
+            } else {
+                f32::INFINITY
+            },
+            if dir.z != 0.0 {
+                (1.0 / dir.z).abs()
+            } else {
+                f32::INFINITY
+            },
+        ];
+        // Distance along the ray to the next voxel boundary on each axis.
+        let mut t_max = [
+            next_boundary(origin.x, voxel[0], dir.x, t_delta[0]),
+            next_boundary(origin.y, voxel[1], dir.y, t_delta[1]),
+            next_boundary(origin.z, voxel[2], dir.z, t_delta[2]),
+        ];
+
+        let mut normal = [0, 0, 0];
+        let mut distance = 0.0;
+        while distance <= max_distance {
+            if self.block(voxel[0], voxel[1], voxel[2]).is_solid() {
+                return Some(RayHit {
+                    block: voxel,
+                    normal,
+                });
+            }
+            // Step into whichever neighbouring voxel the ray reaches first; the
+            // face we enter is the opposite of the step direction.
+            if t_max[0] <= t_max[1] && t_max[0] <= t_max[2] {
+                normal = [-step[0], 0, 0];
+                voxel[0] += step[0];
+                distance = t_max[0];
+                t_max[0] += t_delta[0];
+            } else if t_max[1] <= t_max[2] {
+                normal = [0, -step[1], 0];
+                voxel[1] += step[1];
+                distance = t_max[1];
+                t_max[1] += t_delta[1];
+            } else {
+                normal = [0, 0, -step[2]];
+                voxel[2] += step[2];
+                distance = t_max[2];
+                t_max[2] += t_delta[2];
+            }
+        }
+        None
+    }
+
     /// How many chunks are currently loaded.
     pub fn loaded_count(&self) -> usize {
         self.chunks.len()
@@ -180,6 +308,17 @@ impl Default for World {
 /// horizontal), so only they need re-meshing when the neighbourhood changes.
 fn neighbours((x, z): ChunkPos) -> [ChunkPos; 4] {
     [(x - 1, z), (x + 1, z), (x, z - 1), (x, z + 1)]
+}
+
+/// Distance along the ray from `coord` to the next voxel boundary on one axis.
+fn next_boundary(coord: f32, voxel: i32, dir: f32, t_delta: f32) -> f32 {
+    if dir > 0.0 {
+        (voxel as f32 + 1.0 - coord) * t_delta
+    } else if dir < 0.0 {
+        (coord - voxel as f32) * t_delta
+    } else {
+        f32::INFINITY
+    }
 }
 
 #[cfg(test)]
@@ -243,5 +382,43 @@ mod tests {
         assert_eq!(world.block(0, 66, 0), Block::Air);
         // Negative coordinates land in the chunk to the west, not the wrong one.
         assert_eq!(world.block(-1, 65, -1), Block::Grass);
+    }
+
+    #[test]
+    fn raycast_finds_the_first_solid_block() {
+        let mut world = World::new();
+        world.update(0.0, 0.0);
+
+        // Looking straight down from above the surface (grass tops at y = 65),
+        // entering the top face.
+        let hit = world
+            .raycast(Vec3::new(0.5, 70.0, 0.5), Vec3::new(0.0, -1.0, 0.0), 10.0)
+            .expect("should hit the ground");
+        assert_eq!(hit.block, [0, 65, 0]);
+        assert_eq!(hit.normal, [0, 1, 0], "entered through the top face");
+
+        // Looking straight up hits nothing.
+        assert_eq!(
+            world.raycast(Vec3::new(0.5, 70.0, 0.5), Vec3::new(0.0, 1.0, 0.0), 10.0),
+            None
+        );
+        // Something too far away is out of reach.
+        assert_eq!(
+            world.raycast(Vec3::new(0.5, 200.0, 0.5), Vec3::new(0.0, -1.0, 0.0), 10.0),
+            None
+        );
+    }
+
+    #[test]
+    fn breaking_a_block_clears_it_and_marks_the_chunk_dirty() {
+        let mut world = World::new();
+        world.update(0.0, 0.0);
+        world.take_dirty(usize::MAX);
+
+        world.set_block(1, 65, 1, Block::Air);
+
+        assert_eq!(world.block(1, 65, 1), Block::Air);
+        // An interior block only dirties its own chunk.
+        assert_eq!(world.take_dirty(usize::MAX), vec![(0, 0)]);
     }
 }

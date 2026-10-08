@@ -6,14 +6,16 @@ Built from scratch on [`winit`](https://crates.io/crates/winit) (windowing) and
 [`wgpu`](https://crates.io/crates/wgpu) (rendering) rather than a full game
 engine, so we own the world, meshing and physics code.
 
-> **Status:** early — a 256×256 superflat world (16×16 chunks; bedrock, stone,
-> dirt, grass) meshed with cross-chunk hidden-face culling and drawn from
-> individual PNGs in a `texture_2d_array` (no atlas), through a first-person fly
-> camera.
+> **Status:** early — an **infinite** superflat world (bedrock, stone, dirt, grass)
+> that streams chunks in and out around the player, meshed with cross-chunk
+> hidden-face culling and drawn from individual PNGs in a `texture_2d_array` (no
+> atlas), through a first-person fly camera.
 
 Controls: **mouse** to look, **WASD** to move, **Space**/**Shift** for up/down,
-**Ctrl** to sprint, **double-tap Space** to toggle flight. **Esc** frees the
-cursor; **click** to grab it again. (Gravity/collision land with the player.)
+**Ctrl** to sprint, **double-tap Space** to toggle flight. **Right-click** breaks
+the block you're looking at, **left-click** places the selected block, and the
+**scroll wheel** changes the selection (shown in the hotbar). **Esc** frees the
+cursor; click to grab it.
 
 ## Requirements
 

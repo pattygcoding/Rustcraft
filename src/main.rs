@@ -9,6 +9,7 @@
 
 mod camera;
 mod gfx;
+mod hotbar;
 mod input;
 mod world;
 
@@ -26,14 +27,19 @@ use winit::window::{CursorGrabMode, Window, WindowId};
 
 use crate::camera::Camera;
 use crate::gfx::Renderer;
+use crate::hotbar::Hotbar;
 use crate::input::Input;
-use crate::world::World;
+use crate::world::{Block, World};
 
 /// Title shown in the window's title bar.
 const WINDOW_TITLE: &str = "Rustcraft";
 
 /// Default window size, in logical pixels.
 const WINDOW_SIZE: LogicalSize<f64> = LogicalSize::new(1280.0, 720.0);
+
+/// How far (in blocks) the player can reach to break a block, like Minecraft's
+/// block-reach.
+const REACH: f32 = 6.0;
 
 fn main() -> Result<(), winit::error::EventLoopError> {
     // `RUST_LOG=info` (or `debug`) enables logs; wgpu/winit log through `log`.
@@ -63,6 +69,12 @@ struct App {
     last_frame: Option<Instant>,
     /// Whether the cursor is currently grabbed for mouse-look.
     cursor_captured: bool,
+    /// The blocks you can place, and the current selection.
+    hotbar: Hotbar,
+    /// Right-button state last frame, so breaking fires once per click.
+    breaking: bool,
+    /// Left-button state last frame, so placing fires once per click.
+    placing: bool,
 }
 
 impl ApplicationHandler for App {
@@ -150,15 +162,36 @@ impl ApplicationHandler for App {
                 // Clamp dt so a long stall (dragging the window, ...) can't
                 // teleport the camera.
                 self.camera.update(&input, dt.min(0.1));
+
+                // Scroll the mouse wheel to change the block you'd place.
+                if self.cursor_captured {
+                    let ticks = input.scroll.round() as i32;
+                    if ticks != 0 {
+                        self.hotbar.scroll(ticks);
+                    }
+                }
+
+                // Right-click breaks, left-click places. Detect the press edges so
+                // one click does exactly one of them.
+                let breaking = input.secondary && self.cursor_captured;
+                let placing = input.primary && self.cursor_captured;
                 self.input.end_frame();
 
-                // Stream chunks around the player and mesh a few dirty ones.
+                // Stream chunks, mesh a few dirty ones, and edit the looked-at block.
                 if let Some(world) = self.world.as_mut() {
+                    if breaking && !self.breaking {
+                        break_looked_at_block(world, &self.camera);
+                    }
+                    if placing && !self.placing {
+                        place_looked_at_block(world, &self.camera, self.hotbar.selected());
+                    }
                     world.update(self.camera.position.x, self.camera.position.z);
                     renderer.update_chunks(world);
                 }
+                self.breaking = breaking;
+                self.placing = placing;
 
-                renderer.render(&self.camera);
+                renderer.render(&self.camera, &self.hotbar);
                 // Keep the frames coming.
                 window.request_redraw();
             }
@@ -174,6 +207,37 @@ impl ApplicationHandler for App {
     ) {
         // Raw mouse motion, independent of the cursor: drives camera look.
         self.input.handle_device_event(&event);
+    }
+}
+
+/// Raycast from the camera and clear the first breakable block it hits.
+///
+/// Free functions (rather than methods) so they can run while the renderer is
+/// borrowed for the frame.
+fn break_looked_at_block(world: &mut World, camera: &Camera) {
+    let Some(hit) = world.raycast(camera.position, camera.forward(), REACH) else {
+        return;
+    };
+    let [x, y, z] = hit.block;
+    if world.block(x, y, z).is_breakable() {
+        world.set_block(x, y, z, Block::Air);
+    }
+}
+
+/// Raycast from the camera and place `block` in the empty cell in front of the
+/// first block the ray hits (i.e. against the face it entered through).
+fn place_looked_at_block(world: &mut World, camera: &Camera, block: Block) {
+    let Some(hit) = world.raycast(camera.position, camera.forward(), REACH) else {
+        return;
+    };
+    let (px, py, pz) = (
+        hit.block[0] + hit.normal[0],
+        hit.block[1] + hit.normal[1],
+        hit.block[2] + hit.normal[2],
+    );
+    // Only place into empty space.
+    if !world.block(px, py, pz).is_solid() {
+        world.set_block(px, py, pz, block);
     }
 }
 
@@ -194,4 +258,28 @@ fn set_cursor_captured(window: &Window, captured: bool) {
         log::warn!("could not set cursor grab to {mode:?}: {err}");
     }
     window.set_cursor_visible(!captured);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The starting camera should be looking at a block it can reach and break,
+    /// so breaking works the moment the game opens.
+    #[test]
+    fn default_camera_can_reach_a_block() {
+        let mut world = World::new();
+        let camera = Camera::default();
+        world.update(camera.position.x, camera.position.z);
+
+        let hit = world
+            .raycast(camera.position, camera.forward(), REACH)
+            .expect("the starting camera should be looking at a block");
+        let [x, y, z] = hit.block;
+        assert!(world.block(x, y, z).is_breakable());
+
+        // ...and the cell in front of it is empty, so a block can be placed there.
+        let (px, py, pz) = (x + hit.normal[0], y + hit.normal[1], z + hit.normal[2]);
+        assert!(!world.block(px, py, pz).is_solid());
+    }
 }
