@@ -39,6 +39,22 @@ creative inventory: click a block to pick it up, click a slot to drop it in, or 
 one and press **1–9** to stock that slot. **Esc** closes it (or frees the cursor);
 click to grab the cursor back.
 
+## Showcase
+
+Rolling terraces of grass and oak, shaped by the noise field and running down into the sea:
+
+![A grassy hillside of stepped terraces dotted with oak trees, ending at a blue ocean](shots/showcase/world.png)
+
+Underground, where the carvers' worms have been: a tunnel winding through the stone, lit only
+by such sky light as reaches down it, with the sun's shadow map darkening the walls:
+
+![A cave tunnel through grey stone, dimly lit, with a shaft of daylight entering from above](shots/showcase/caves.png)
+
+And what you can build with it — an oak-plank house with a glass window, standing on a cliff
+above the water with flowers planted round it:
+
+![An oak-plank house with a glass window on a grassy cliff overlooking water, ringed by flowers](shots/showcase/house.png)
+
 ## Requirements
 
 * A stable Rust toolchain (edition 2024).
