@@ -6,8 +6,9 @@
 //!
 //! * WASD to move, Space to jump (or ascend while flying), Shift to sneak (or
 //!   descend while flying), Ctrl to sprint.
-//! * Mouse motion steers the camera; left/right buttons break/place; the wheel
-//!   selects the hotbar (those last two are captured but unused so far).
+//! * Mouse motion steers the camera; left/right buttons break/place; the wheel and
+//!   the 1–9 keys pick an inventory slot; `E` toggles the creative inventory, and
+//!   while that is open the screen reads the cursor position and the same buttons.
 //! * **Double-tapping Space toggles flight.**
 //!
 //! Wiring from the winit `ApplicationHandler`:
@@ -35,12 +36,29 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 /// How quickly a second press must follow the first to count as a double-tap.
 pub const DEFAULT_DOUBLE_TAP: Duration = Duration::from_millis(300);
 
+/// The number keys, in slot order. In the world they choose a quick-access slot; on the
+/// creative screen they stock one.
+const SLOT_KEYS: [KeyCode; 9] = [
+    KeyCode::Digit1,
+    KeyCode::Digit2,
+    KeyCode::Digit3,
+    KeyCode::Digit4,
+    KeyCode::Digit5,
+    KeyCode::Digit6,
+    KeyCode::Digit7,
+    KeyCode::Digit8,
+    KeyCode::Digit9,
+];
+
 /// Tracks the instantaneous state of the keyboard and mouse.
 pub struct Input {
     keys: HashSet<KeyCode>,
     mouse_buttons: HashSet<MouseButton>,
     look_delta: Vec2,
     scroll: f32,
+    /// Where the cursor is, in physical pixels. Only the inventory reads it: mouse-look uses
+    /// the raw motion above instead, so the two never fight.
+    cursor: Vec2,
     flying: bool,
     space_double_tap: DoubleTap,
     double_tap_window: Duration,
@@ -60,6 +78,7 @@ impl Input {
             mouse_buttons: HashSet::new(),
             look_delta: Vec2::ZERO,
             scroll: 0.0,
+            cursor: Vec2::ZERO,
             flying: false,
             space_double_tap: DoubleTap::default(),
             double_tap_window: DEFAULT_DOUBLE_TAP,
@@ -82,6 +101,9 @@ impl Input {
                 }
             },
             WindowEvent::MouseWheel { delta, .. } => self.scroll += wheel_ticks(delta),
+            WindowEvent::CursorMoved { position, .. } => {
+                self.cursor = Vec2::new(position.x as f32, position.y as f32);
+            }
             // Drop all held input if we lose focus, so keys don't "stick".
             WindowEvent::Focused(false) => self.release_all(),
             _ => {}
@@ -118,6 +140,9 @@ impl Input {
             scroll: self.scroll,
             primary: self.is_mouse_pressed(MouseButton::Left),
             secondary: self.is_mouse_pressed(MouseButton::Right),
+            inventory: self.is_key_pressed(KeyCode::KeyE),
+            slots: std::array::from_fn(|index| self.is_key_pressed(SLOT_KEYS[index])),
+            cursor: self.cursor,
         }
     }
 
@@ -199,10 +224,16 @@ pub struct PlayerInput {
     pub look: Vec2,
     /// Mouse-wheel ticks since the previous frame (positive = away from the user).
     pub scroll: f32,
-    /// Left mouse button held (break/attack, once implemented).
+    /// Left mouse button held (break/attack in the world, pick up/drop on the inventory).
     pub primary: bool,
-    /// Right mouse button held (place/use, once implemented).
+    /// Right mouse button held (place/use in the world, pick up/drop on the inventory).
     pub secondary: bool,
+    /// `E` held: toggles the creative inventory.
+    pub inventory: bool,
+    /// The 1–9 keys, in slot order.
+    pub slots: [bool; 9],
+    /// Cursor position in physical pixels, for the inventory screen.
+    pub cursor: Vec2,
 }
 
 /// Convert a wheel event into fractional "ticks".
