@@ -2309,6 +2309,7 @@ dependencies = [
  "glam",
  "image",
  "log",
+ "naga",
  "noise",
  "pollster",
  "wgpu",

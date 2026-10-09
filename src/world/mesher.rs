@@ -17,6 +17,13 @@
 //! top of the cell (see [`Block::surface_height`]), so a shoreline reads as a step down
 //! into the water, and a lava pool as a step down into the lava. A fluid buried under
 //! another fluid keeps the full height, so columns of sea have no seam in them.
+//!
+//! Because a fluid stops short, **a fluid hides only faces of its own kind** (see
+//! [`Block::hides_face_of`]): the slice above its surface is empty, so a face a fluid culled
+//! would leave a slit there with nothing drawn across it — and the rock beside a pool, or the
+//! rock above it, would show *through* that slit. The shore, the sea bed and the rock over a
+//! lava sea therefore all keep their faces: a price paid in triangles *around* a pool, which
+//! are hidden by the pool's own geometry, rather than in a see-through seam at its waterline.
 
 use std::ops::{Add, Mul};
 
@@ -134,8 +141,11 @@ pub fn mesh_chunk(
 
                 for (face, [dx, dy, dz]) in NEIGHBOURS.iter().copied().enumerate() {
                     let (nx, ny, nz) = (x as i32 + dx, y as i32 + dy, z as i32 + dz);
-                    // Skip faces the neighbour hides — an opaque block hides every
-                    // face, water only hides other water (see `Block::hides_face_of`).
+                    // Skip faces the neighbour hides — an opaque block hides every face, a
+                    // see-through one hides only its own kind, and the fluids (which stop
+                    // short of their cell) hide only their own kind too, so the rock around
+                    // a pool keeps the faces that would otherwise leave a slit above it.
+                    // See `Block::hides_face_of`.
                     if neighbour_block(chunk, origin, world, nx, ny, nz).hides_face_of(block) {
                         continue;
                     }
@@ -145,6 +155,13 @@ pub fn mesh_chunk(
                     // That is smooth lighting; see `corner_light`.
                     let light =
                         face_light(chunk, origin, world, [x as i32, y as i32, z as i32], face);
+                    // Water carries the flag the blend pass ripples on. Nothing else does — a
+                    // glass pane shares that pass and is flat.
+                    let light = if block.ripples() {
+                        light.map(mesh::wavy)
+                    } else {
+                        light
+                    };
                     mesh::push_face(
                         &mut geometry.vertices,
                         &mut geometry.indices,
@@ -386,8 +403,11 @@ fn face_light(
     face: usize,
 ) -> [u32; 4] {
     let [dx, dy, dz] = NEIGHBOURS[face];
-    // The open cell the face looks into. Note that it is never opaque — an opaque neighbour
-    // would have hidden the face (see `Block::hides_face_of`) — so its light is a real one.
+    // The cell the face looks into. It is opaque in exactly one case: the rock around a fluid,
+    // which keeps its face because the fluid stops short of its cell (see
+    // `Block::hides_face_of`). That cell's light is still a real one — a fluid is a light
+    // *source* — so the corners come out as they should: the rock at a lava pool's waterline
+    // glows where the pool does, and is shaded into a crease where it meets it.
     let front = [block[0] + dx, block[1] + dy, block[2] + dz];
     let grid = corner_grid(front, face).map(|row| {
         row.map(|[nx, ny, nz]| {
@@ -404,6 +424,67 @@ fn face_light(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The invariant the mesher leans on, checked over a **generated** chunk: wherever two cells
+    /// meet, the plane between them must be covered — by a face the mesher emits, or by the two
+    /// blocks filling it.
+    ///
+    /// This is the test that would have caught the see-through seam at a lava pool: lava *hid*
+    /// the rock's face and the rock hid lava's, and because lava stops short of its cell neither
+    /// face was drawn across the top slice of it, so the rock showed through the slit.
+    #[test]
+    fn no_plane_between_two_blocks_is_left_undrawn() {
+        use super::super::terrain::{DEFAULT_SEED, Terrain};
+        let terrain = Terrain::new(DEFAULT_SEED);
+        let mut pairs = 0usize;
+
+        for pos in [(0, 0), (1, 0), (0, 1)] {
+            let chunk = terrain.generate_chunk(pos);
+            for y in 0..chunk.height() as i32 {
+                for z in 0..DEPTH as i32 {
+                    for x in 0..WIDTH as i32 {
+                        let block = chunk.get(x, y, z);
+                        if block.is_air() {
+                            continue;
+                        }
+                        for [dx, dy, dz] in NEIGHBOURS {
+                            // Only the +X/+Y/+Z directions, so each pair is visited once.
+                            if dx + dy + dz <= 0 {
+                                continue;
+                            }
+                            let (nx, ny, nz) = (x + dx, y + dy, z + dz);
+                            if !in_chunk(nx, ny, nz) {
+                                continue;
+                            }
+                            let neighbour = chunk.get(nx, ny, nz);
+                            if neighbour.is_air() {
+                                continue;
+                            }
+                            pairs += 1;
+                            // At least one of the two faces is emitted...
+                            let drawn =
+                                !neighbour.hides_face_of(block) || !block.hides_face_of(neighbour);
+                            // ...or the two blocks both fill the plane, so it is inside matter...
+                            let covered =
+                                block.surface_height() == 1.0 && neighbour.surface_height() == 1.0;
+                            // ...or both stop short in the same way, so the slice above them is
+                            // air on both sides and seeing through it is right.
+                            let both_short = block == neighbour;
+                            assert!(
+                                drawn || covered || both_short,
+                                "{block:?} beside {neighbour:?} at ({x}, {y}, {z}) in {pos:?} \
+                                 leaves a plane with nothing drawn across it"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            pairs > 0,
+            "the generated chunks had no neighbouring blocks?"
+        );
+    }
 
     #[test]
     fn only_an_exposed_fluid_stops_short_of_a_full_block() {

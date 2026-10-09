@@ -8,9 +8,14 @@
 //! come next — see `AGENTS.md` for the roadmap.
 
 mod camera;
+mod font;
 mod gfx;
 mod input;
 mod inventory;
+mod item;
+mod lang;
+mod pause;
+mod ui;
 mod world;
 
 use std::sync::Arc;
@@ -29,6 +34,8 @@ use crate::camera::Camera;
 use crate::gfx::Renderer;
 use crate::input::Input;
 use crate::inventory::{Inventory, SLOTS};
+use crate::item::Item;
+use crate::pause::{Action, PauseMenu};
 use crate::world::{Block, DEFAULT_SEED, SEA_LEVEL, World, chunk_of};
 
 /// Title shown in the window's title bar.
@@ -85,10 +92,14 @@ struct App {
     cursor_captured: bool,
     /// The blocks you can place, and the creative screen that fills them.
     inventory: Inventory,
+    /// The pause menu `Esc` opens, and the screen that Continue or Exit acts on.
+    pause: PauseMenu,
     /// Right-button state last frame, so breaking fires once per click.
     breaking: bool,
     /// Left-button state last frame, so placing fires once per click.
     placing: bool,
+    /// Middle-button state last frame, so picking a block fires once per click.
+    picking: bool,
     /// `E` state last frame, so the screen toggles once per press.
     inventory_key: bool,
     /// 1–9 state last frame, so each press stocks or picks a slot exactly once.
@@ -162,14 +173,22 @@ impl ApplicationHandler for App {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
 
-            // Escape closes the inventory if it is open, and otherwise just frees the cursor.
-            // A left click grabs the cursor back — unless the inventory wants that click.
+            // Escape opens the pause menu, and closes it again — the cursor comes back with it.
+            // A left click grabs the cursor back — unless one of the screens wants that click.
             WindowEvent::KeyboardInput { event, .. }
                 if event.state == ElementState::Pressed
                     && event.physical_key == PhysicalKey::Code(KeyCode::Escape) =>
             {
-                let captured = self.inventory.is_open();
-                self.inventory.set_open(false);
+                if self.pause.is_open() {
+                    // Escape is Continue's keyboard twin.
+                    self.pause.set_open(false);
+                } else {
+                    // Pausing shuts the creative screen, so the menu is the only thing holding
+                    // the cursor and its buttons are the only thing a click can land on.
+                    self.inventory.set_open(false);
+                    self.pause.set_open(true);
+                }
+                let captured = !self.pause.is_open();
                 set_cursor_captured(window, captured);
                 self.cursor_captured = captured;
             }
@@ -177,7 +196,7 @@ impl ApplicationHandler for App {
                 state: ElementState::Pressed,
                 button: MouseButton::Left,
                 ..
-            } if !self.cursor_captured && !self.inventory.is_open() => {
+            } if !self.cursor_captured && !self.inventory.is_open() && !self.pause.is_open() => {
                 set_cursor_captured(window, true);
                 self.cursor_captured = true;
             }
@@ -192,24 +211,31 @@ impl ApplicationHandler for App {
                 self.last_frame = Some(now);
 
                 // Sample this frame's intent. Mouse-look is ignored while the cursor is free
-                // — after Escape, or while the inventory is open.
+                // — after Escape, or while a screen is open.
                 let mut input = self.input.snapshot();
                 if !self.cursor_captured {
                     input.look = Vec2::ZERO;
                 }
+                // A paused world does not move: the camera is left exactly where it was, so
+                // nothing slides about behind the menu you are reading.
+                let paused = self.pause.is_open();
                 // Clamp dt so a long stall (dragging the window, ...) can't
                 // teleport the camera.
-                self.camera.update(&input, dt.min(0.1));
+                if !paused {
+                    self.camera.update(&input, dt.min(0.1));
+                }
 
-                // The inventory reads the cursor, so it needs one aspect ratio everybody
+                // Both screens read the cursor, so they need one aspect ratio everybody
                 // agrees on.
                 let size = window.inner_size();
                 let aspect = size.width as f32 / size.height.max(1) as f32;
                 let cursor = cursor_ndc(input.cursor, size.width, size.height);
                 self.inventory.set_cursor(cursor, aspect);
+                self.pause.set_cursor(cursor, aspect);
 
                 // `E` opens and closes the creative screen, and hands the cursor over with it.
-                if input.inventory && !self.inventory_key {
+                // A paused game ignores it: the menu is the one screen on top.
+                if input.inventory && !self.inventory_key && !paused {
                     let open = !self.inventory.is_open();
                     self.inventory.set_open(open);
                     set_cursor_captured(window, !open);
@@ -217,55 +243,82 @@ impl ApplicationHandler for App {
                 }
                 self.inventory_key = input.inventory;
 
-                // 1–9: choose a slot in the world, or stock one on the creative screen.
-                for (index, &held) in input.slots.iter().enumerate() {
-                    if held && !self.slots[index] {
-                        self.inventory.number_key(index + 1);
+                // 1–9: choose a slot in the world, or stock one on the creative screen. A
+                // paused game has nothing to choose.
+                if !paused {
+                    for (index, &held) in input.slots.iter().enumerate() {
+                        if held && !self.slots[index] {
+                            self.inventory.number_key(index + 1);
+                        }
                     }
                 }
                 self.slots = input.slots;
 
                 let open = self.inventory.is_open();
+                // The world takes input only when nothing stands over it: no screen, and a
+                // cursor that is held for looking around.
+                let in_world = !open && !paused && self.cursor_captured;
 
                 // Scroll the mouse wheel to change the block you'd place.
-                if !open {
+                if in_world {
                     let ticks = input.scroll.round() as i32;
                     if ticks != 0 {
                         self.inventory.scroll(ticks);
                     }
                 }
 
-                // Right-click breaks, left-click places. Detect the press edges on the *raw*
-                // buttons so one click does exactly one thing, and let the screen have those
-                // clicks while it is open — the cursor is free then, so gating on it would
-                // mean the screen never saw a click at all.
+                // Right-click breaks, left-click places, and the wheel button picks the block
+                // being looked at. Detect the press edges on the *raw* buttons so one click does
+                // exactly one thing, and let a screen have those clicks while it is open — the
+                // cursor is free then, so gating on it would mean the screen never saw a click at
+                // all.
                 let left_pressed = input.primary && !self.placing;
                 let right_pressed = input.secondary && !self.breaking;
+                let middle_pressed = input.middle && !self.picking;
                 self.placing = input.primary;
                 self.breaking = input.secondary;
-                if open && (left_pressed || right_pressed) {
+                self.picking = input.middle;
+                if paused && left_pressed {
+                    // A click on the menu: Continue hands the cursor back to the world, Exit
+                    // stops the event loop and so ends the game.
+                    match self.pause.click(cursor, aspect) {
+                        Some(Action::Continue) => {
+                            self.pause.set_open(false);
+                            set_cursor_captured(window, true);
+                            self.cursor_captured = true;
+                        }
+                        Some(Action::Exit) => event_loop.exit(),
+                        None => {}
+                    }
+                } else if open && (left_pressed || right_pressed) {
                     self.inventory.click(cursor, aspect);
                 }
                 self.input.end_frame();
 
                 // Stream chunks, mesh a few dirty ones, and edit the looked-at block.
                 if let Some(world) = self.world.as_mut() {
-                    let in_world = !open && self.cursor_captured;
                     if in_world && right_pressed {
                         break_looked_at_block(world, &self.camera);
                     }
-                    // Left-click places — if the selected slot holds anything at all.
-                    let to_place = (in_world && left_pressed)
-                        .then(|| self.inventory.selected())
-                        .flatten();
-                    if let Some(block) = to_place {
-                        place_looked_at_block(world, &self.camera, block);
+                    // The wheel button picks what is being looked at into the selected slot.
+                    if in_world && middle_pressed {
+                        pick_looked_at_item(world, &self.camera, &mut self.inventory);
+                    }
+                    // Left-click uses what is in hand: a block is placed; a bucket pours, or
+                    // scoops a fluid up.
+                    if in_world && left_pressed {
+                        use_selected_item(world, &self.camera, &mut self.inventory);
                     }
                     world.update(self.camera.position.x, self.camera.position.z);
                     renderer.update_chunks(world);
                 }
 
-                renderer.render(&self.camera, &self.inventory);
+                renderer.render(
+                    &self.camera,
+                    &self.inventory,
+                    &self.pause,
+                    input.full_bright,
+                );
                 // Keep the frames coming.
                 window.request_redraw();
 
@@ -340,9 +393,50 @@ fn break_looked_at_block(world: &mut World, camera: &Camera) {
     }
 }
 
-/// Raycast from the camera and place `block` in the empty cell in front of the
-/// first block the ray hits (i.e. against the face it entered through).
-fn place_looked_at_block(world: &mut World, camera: &Camera, block: Block) {
+/// Raycast from the camera and **pick** what it finds: the block it hits, or — for a fluid, which
+/// a pick should hand you the way Minecraft's does — the bucket that fluid comes in.
+///
+/// This is Minecraft's pick-block. It uses the *bucket's* ray rather than the mining one, because
+/// what you are looking at when you look at water is the water; a pick that handed you the sand
+/// under the sea would not be a pick of what the crosshair is on.
+fn pick_looked_at_item(world: &World, camera: &Camera, inventory: &mut Inventory) {
+    let Some(hit) = world.raycast_anything(camera.position, camera.forward(), REACH) else {
+        return;
+    };
+    let [x, y, z] = hit.block;
+    let block = world.block(x, y, z);
+    inventory.pick_item(Item::bucket_of(block).unwrap_or(Item::Block(block)));
+}
+
+/// **Use** whatever is in hand on whatever the camera is looking at: place a block against it,
+/// pour a bucket of water or lava into it, or scoop a fluid up into an empty bucket.
+///
+/// The three are one gesture — the same button, the same reach — and which of them happens is the
+/// item's business (see [`crate::item`]). A bucket is spent by both pouring and filling: the slot
+/// comes out holding an empty bucket, or the full one, so what is in hand is always what you have.
+fn use_selected_item(world: &mut World, camera: &Camera, inventory: &mut Inventory) {
+    let Some(item) = inventory.selected() else {
+        return;
+    };
+
+    // An empty bucket reaches for a fluid itself — the one thing the mining ray looks straight
+    // through — and `raycast_anything` takes the nearest thing of *either* kind, so this refuses
+    // anything that is not a fluid and nothing can be scooped through a wall.
+    if item == Item::Bucket {
+        let Some(hit) = world.raycast_anything(camera.position, camera.forward(), REACH) else {
+            return;
+        };
+        let [x, y, z] = hit.block;
+        let Some(filled) = Item::bucket_of(world.block(x, y, z)) else {
+            return;
+        };
+        world.set_block(x, y, z, Block::Air);
+        inventory.set_selected(filled);
+        return;
+    }
+
+    // Everything else goes into the cell the ray enters through: a block placed, or the fluid a
+    // full bucket pours.
     let Some(hit) = world.raycast(camera.position, camera.forward(), REACH) else {
         return;
     };
@@ -351,9 +445,21 @@ fn place_looked_at_block(world: &mut World, camera: &Camera, block: Block) {
         hit.block[1] + hit.normal[1],
         hit.block[2] + hit.normal[2],
     );
-    // Only place into free space: air, or a fluid you are building over.
-    if world.block(px, py, pz).is_replaceable() {
-        world.set_block(px, py, pz, block);
+    // Only into free space: air, or a fluid you are building over.
+    if !world.block(px, py, pz).is_replaceable() {
+        return;
+    }
+    match item.pours() {
+        // Poured out — and the slot is left holding the empty bucket it came from.
+        Some(fluid) => {
+            world.set_block(px, py, pz, fluid);
+            inventory.set_selected(Item::Bucket);
+        }
+        None => {
+            if let Some(block) = item.block() {
+                world.set_block(px, py, pz, block);
+            }
+        }
     }
 }
 
@@ -405,27 +511,43 @@ fn set_cursor_captured(window: &Window, captured: bool) {
 mod tests {
     use super::*;
 
-    /// The camera should spawn standing on solid ground — or on the sea, when the
-    /// ground there is under water — never buried inside a block, even after an oak
-    /// has grown on that ground.
-    #[test]
-    fn the_starting_camera_stands_on_solid_ground_and_is_never_buried() {
+    /// A world with its spawn chunks in, and the camera standing on the real ground at `(8.5,
+    /// 8.5)` — clear of a cell corner, so a ray straight down has one cell to pass through — with
+    /// the `y` of the block underfoot. What every test here needs before it can look at something.
+    fn standing_on_the_ground() -> (World, Camera, i32) {
         let mut world = World::new(DEFAULT_SEED);
         let mut camera = Camera::default();
+        camera.position.x = 8.5;
+        camera.position.z = 8.5;
         world.update(camera.position.x, camera.position.z);
         // The game waits only for the spawn neighbourhood before standing the camera on it, which
         // is what this mirrors.
         world.flush_around(chunk_of(camera.position.x, camera.position.z));
         place_camera_on_surface(&mut camera, &world);
 
-        let x = camera.position.x.floor() as i32;
-        let z = camera.position.z.floor() as i32;
-
+        let (x, z) = (
+            camera.position.x.floor() as i32,
+            camera.position.z.floor() as i32,
+        );
         // The walkable surface is the ground, or the top of an oak standing on it.
         let mut ground = world.surface_height(x, z).max(SEA_LEVEL);
         while !world.block(x, ground + 1, z).is_replaceable() {
             ground += 1;
         }
+        (world, camera, ground)
+    }
+
+    /// The camera should spawn standing on solid ground — or on the sea, when the
+    /// ground there is under water — never buried inside a block, even after an oak
+    /// has grown on that ground.
+    #[test]
+    fn the_starting_camera_stands_on_solid_ground_and_is_never_buried() {
+        let (world, camera, ground) = standing_on_the_ground();
+        let (x, z) = (
+            camera.position.x.floor() as i32,
+            camera.position.z.floor() as i32,
+        );
+
         // Something solid underfoot: ground on land, water over the sea.
         let underfoot = world.block(x, ground, z);
         assert!(
@@ -440,5 +562,222 @@ mod tests {
                 "spawned inside a block at y = {y}"
             );
         }
+    }
+
+    /// Pick-block, end to end: look at a block, press the wheel button, and the block you were
+    /// looking at is the one you would place.
+    #[test]
+    fn picking_puts_the_block_being_looked_at_in_the_selected_slot() {
+        let (mut world, mut camera, ground) = standing_on_the_ground();
+        let (x, z) = (
+            camera.position.x.floor() as i32,
+            camera.position.z.floor() as i32,
+        );
+
+        // Something unmistakable underfoot — and one the quick-access row does *not* already
+        // hold — so a pick that did nothing at all could not pass this test.
+        world.set_block(x, ground, z, Block::Bedrock);
+
+        let mut inventory = Inventory::new();
+        inventory.number_key(7);
+        let held = inventory.selected_index();
+        assert_eq!(
+            inventory.selected(),
+            Some(Item::Block(Block::Poppy)),
+            "holding something else"
+        );
+
+        // Look straight down at it, and pick.
+        camera.pitch = -1.5;
+        pick_looked_at_item(&world, &camera, &mut inventory);
+
+        assert_eq!(inventory.selected_index(), held, "the same slot is held");
+        assert_eq!(
+            inventory.selected(),
+            Some(Item::Block(Block::Bedrock)),
+            "and it now holds the block that was aimed at"
+        );
+    }
+
+    /// Picking something the row already holds selects *that* slot instead of overwriting the one
+    /// in hand — the other half of the rule, through the same camera.
+    #[test]
+    fn picking_a_block_the_row_already_holds_selects_its_own_slot() {
+        let (mut world, mut camera, ground) = standing_on_the_ground();
+        let (x, z) = (
+            camera.position.x.floor() as i32,
+            camera.position.z.floor() as i32,
+        );
+        world.set_block(x, ground, z, Block::Stone);
+
+        let mut inventory = Inventory::new();
+        inventory.number_key(1);
+        camera.pitch = -1.5;
+        pick_looked_at_item(&world, &camera, &mut inventory);
+
+        // Stone is the third slot, and picking it goes there rather than over slot 1.
+        assert_eq!(inventory.selected(), Some(Item::Block(Block::Stone)));
+        assert_eq!(inventory.selected_index(), 2);
+    }
+
+    /// Looking at nothing picks nothing: the slot in hand is left exactly as it was.
+    #[test]
+    fn picking_the_sky_leaves_the_slot_alone() {
+        let (world, mut camera, _) = standing_on_the_ground();
+        camera.pitch = 1.5; // straight up, at an empty sky
+        let mut inventory = Inventory::new();
+        inventory.number_key(7);
+        pick_looked_at_item(&world, &camera, &mut inventory);
+        assert_eq!(inventory.selected(), Some(Item::Block(Block::Poppy)));
+    }
+
+    /// Right-click breaks what the camera is looking at — **bedrock included**. There is no
+    /// survival mode to be kept out of the bottom of the world with, so the floor of the world is
+    /// the player's to take apart like anything else.
+    #[test]
+    fn bedrock_can_be_broken() {
+        let (mut world, mut camera, ground) = standing_on_the_ground();
+        let [x, z] = [
+            camera.position.x.floor() as i32,
+            camera.position.z.floor() as i32,
+        ];
+        world.set_block(x, ground, z, Block::Bedrock);
+
+        camera.pitch = -1.5; // straight down, at the bedrock underfoot
+        break_looked_at_block(&mut world, &camera);
+
+        assert_eq!(world.block(x, ground, z), Block::Air, "the bedrock is gone");
+    }
+
+    /// Picking a fluid hands over the **bucket** it comes in, which is what Minecraft does and
+    /// what makes a pick of the sea useful — the block underneath it is not what the crosshair is
+    /// on.
+    #[test]
+    fn picking_a_fluid_gives_its_bucket() {
+        let (mut world, mut camera, _) = standing_on_the_ground();
+        let (x, z) = (
+            camera.position.x.floor() as i32,
+            camera.position.z.floor() as i32,
+        );
+        // A pool of water in the air, a couple of blocks over, with the camera looking into it.
+        let pool = 150;
+        world.set_block(x + 2, pool, z, Block::Water);
+        camera.position.y = pool as f32 + 0.5;
+        camera.pitch = 0.0;
+        camera.yaw = std::f32::consts::FRAC_PI_2; // yaw 90° looks toward +X
+
+        let mut inventory = Inventory::new();
+        pick_looked_at_item(&world, &camera, &mut inventory);
+
+        assert_eq!(
+            inventory.selected(),
+            Some(Item::WaterBucket),
+            "the water it is looking at, in a bucket"
+        );
+    }
+
+    /// Pouring a bucket: the fluid lands in the cell the ray enters, and the slot is left holding
+    /// an *empty* bucket — one pour per bucket, the way Minecraft spends one.
+    #[test]
+    fn a_full_bucket_pours_its_fluid_and_is_left_empty() {
+        let (mut world, mut camera, ground) = standing_on_the_ground();
+        let (x, z) = (
+            camera.position.x.floor() as i32,
+            camera.position.z.floor() as i32,
+        );
+        // Look straight down at the ground, holding a water bucket. The cell the ray enters is
+        // the one above the ground — the one the camera is standing in.
+        camera.pitch = -1.5;
+        let mut inventory = Inventory::new();
+        inventory.set_selected(Item::WaterBucket);
+
+        use_selected_item(&mut world, &camera, &mut inventory);
+
+        assert_eq!(
+            world.block(x, ground + 1, z),
+            Block::Water,
+            "the water is in the world"
+        );
+        assert_eq!(
+            inventory.selected(),
+            Some(Item::Bucket),
+            "and the bucket is empty again"
+        );
+    }
+
+    /// The same for lava, which is the other fluid a bucket holds.
+    #[test]
+    fn a_lava_bucket_pours_lava() {
+        let (mut world, mut camera, ground) = standing_on_the_ground();
+        let (x, z) = (
+            camera.position.x.floor() as i32,
+            camera.position.z.floor() as i32,
+        );
+        camera.pitch = -1.5;
+        let mut inventory = Inventory::new();
+        inventory.set_selected(Item::LavaBucket);
+
+        use_selected_item(&mut world, &camera, &mut inventory);
+
+        assert_eq!(world.block(x, ground + 1, z), Block::Lava);
+        assert_eq!(inventory.selected(), Some(Item::Bucket));
+    }
+
+    /// Filling an empty bucket: the fluid is taken out of the world and the bucket comes back
+    /// full — the exact inverse of pouring.
+    #[test]
+    fn an_empty_bucket_scoops_the_fluid_it_is_held_over() {
+        let (mut world, mut camera, _) = standing_on_the_ground();
+        let (x, z) = (
+            camera.position.x.floor() as i32,
+            camera.position.z.floor() as i32,
+        );
+        // A pool of water out in the air, with the camera looking into it.
+        let pool = 150;
+        world.set_block(x + 2, pool, z, Block::Water);
+        camera.position.y = pool as f32 + 0.5;
+        camera.pitch = 0.0;
+        camera.yaw = std::f32::consts::FRAC_PI_2; // yaw 90° looks toward +X
+
+        let mut inventory = Inventory::new();
+        inventory.set_selected(Item::Bucket);
+        use_selected_item(&mut world, &camera, &mut inventory);
+
+        assert_eq!(
+            world.block(x + 2, pool, z),
+            Block::Air,
+            "the water is gone from the world"
+        );
+        assert_eq!(
+            inventory.selected(),
+            Some(Item::WaterBucket),
+            "and it is in the bucket"
+        );
+    }
+
+    /// An empty bucket held over a *block* scoops nothing: a bucket fills from fluids, and the
+    /// nearest thing of either kind is what it looks at.
+    #[test]
+    fn an_empty_bucket_does_nothing_to_a_block() {
+        let (mut world, mut camera, ground) = standing_on_the_ground();
+        let (x, z) = (
+            camera.position.x.floor() as i32,
+            camera.position.z.floor() as i32,
+        );
+        camera.pitch = -1.5; // straight down at the ground
+        let mut inventory = Inventory::new();
+        inventory.set_selected(Item::Bucket);
+
+        use_selected_item(&mut world, &camera, &mut inventory);
+
+        assert!(
+            !world.block(x, ground, z).is_air(),
+            "the ground is still there"
+        );
+        assert_eq!(
+            inventory.selected(),
+            Some(Item::Bucket),
+            "and the bucket is still empty"
+        );
     }
 }

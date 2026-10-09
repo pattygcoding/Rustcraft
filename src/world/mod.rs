@@ -47,10 +47,11 @@ pub type ChunkPos = (i32, i32);
 /// The horizontal size of a chunk, in blocks.
 pub const CHUNK_SIZE: i32 = chunk::WIDTH as i32;
 
-/// A block hit by a [`World::raycast`].
+/// A block hit by a [`World::raycast`] — or, for the bucket's [`World::raycast_anything`], the
+/// fluid it found instead.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RayHit {
-    /// Coordinates of the opaque block that was hit.
+    /// Coordinates of the block (or fluid) that was hit.
     pub block: [i32; 3],
     /// Unit axis of the face that was entered (e.g. `[0, 1, 0]` for the top).
     ///
@@ -420,11 +421,39 @@ impl World {
     /// Air and water are both see-through to a ray, so it passes straight through them:
     /// looking at the sea aims at its bed rather than the water, while glass and leaves
     /// are aimed at directly.
-    ///
-    /// Uses the Amanatides–Woo grid-traversal (a "DDA"): it walks from voxel to
-    /// voxel along the ray rather than sampling at fixed steps, so it never skips
-    /// a block however thin the angle.
     pub fn raycast(&self, origin: Vec3, direction: Vec3, max_distance: f32) -> Option<RayHit> {
+        self.raycast_until(origin, direction, max_distance, |block| {
+            block.is_targetable()
+        })
+    }
+
+    /// Cast a ray that stops at the first cell holding **anything at all** — a block to mine, or
+    /// a fluid to scoop.
+    ///
+    /// This is the *bucket's* ray. An empty bucket has to find the water it is held over, which
+    /// [`World::raycast`] looks straight through — and it must not find it through a wall, so it
+    /// takes the nearest thing of either kind rather than the first fluid along the ray. A full
+    /// bucket is poured the same way, so "what you are looking at" means one thing for both
+    /// halves of the bucket.
+    pub fn raycast_anything(
+        &self,
+        origin: Vec3,
+        direction: Vec3,
+        max_distance: f32,
+    ) -> Option<RayHit> {
+        self.raycast_until(origin, direction, max_distance, |block| !block.is_air())
+    }
+
+    /// The grid-traversal both rays share: walk from voxel to voxel, and stop at the first one
+    /// `stop` accepts. The Amanatides–Woo DDA — it steps from voxel to voxel rather than sampling
+    /// at fixed intervals, so it never skips a block however thin the angle.
+    fn raycast_until(
+        &self,
+        origin: Vec3,
+        direction: Vec3,
+        max_distance: f32,
+        stop: impl Fn(Block) -> bool,
+    ) -> Option<RayHit> {
         let dir = direction.normalize_or_zero();
         if dir == Vec3::ZERO {
             return None;
@@ -468,7 +497,7 @@ impl World {
         let mut normal = [0, 0, 0];
         let mut distance = 0.0;
         while distance <= max_distance {
-            if self.block(voxel[0], voxel[1], voxel[2]).is_targetable() {
+            if stop(self.block(voxel[0], voxel[1], voxel[2])) {
                 return Some(RayHit {
                     block: voxel,
                     normal,
@@ -709,6 +738,41 @@ mod tests {
             world.raycast(Vec3::new(0.5, 200.0, 0.5), Vec3::new(0.0, -1.0, 0.0), 10.0),
             None
         );
+    }
+
+    /// The bucket's ray stops at the first thing of *any* kind. That is what lets an empty bucket
+    /// find the water it is held over — which the ordinary ray looks straight through — and it
+    /// still finds nothing *through* a wall, because the nearest thing is the one it takes.
+    #[test]
+    fn the_bucket_ray_stops_at_a_fluid_the_plain_one_looks_through() {
+        let mut world = World::new(DEFAULT_SEED);
+        world.update(0.0, 0.0);
+        world.flush();
+
+        // High above any terrain, so what the ray meets is exactly what this test put there.
+        let (x, y, z) = (4, 150, 4);
+        world.set_block(x, y, z, Block::Water);
+        let from = Vec3::new(x as f32 + 0.5, y as f32 + 3.5, z as f32 + 0.5);
+        let down = Vec3::new(0.0, -1.0, 0.0);
+
+        assert_eq!(
+            world.raycast(from, down, 10.0),
+            None,
+            "the plain ray passes straight through water"
+        );
+        let scoop = world
+            .raycast_anything(from, down, 10.0)
+            .expect("the bucket's ray finds it");
+        assert_eq!(scoop.block, [x, y, z]);
+        assert!(world.block(x, y, z).is_fluid(), "and it is the fluid");
+
+        // A wall above the water: the bucket's ray stops at the wall, so nothing can be scooped
+        // through it.
+        world.set_block(x, y + 1, z, Block::Stone);
+        let hit = world.raycast_anything(from, down, 10.0).expect("the wall");
+        assert_eq!(hit.block, [x, y + 1, z], "the nearest thing, not the water");
+        assert!(!world.block(x, y + 1, z).is_fluid());
+        assert_eq!(hit.normal, [0, 1, 0], "entered through its top face");
     }
 
     #[test]

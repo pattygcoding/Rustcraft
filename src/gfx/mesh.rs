@@ -141,11 +141,28 @@ impl BlockIcon {
 ///   the daylight away, but nothing may take the block light away.
 /// * bits 16–18 — the **face index** (`[+X, -X, +Y, -Y, +Z, -Z]`), so the shaders can catch the
 ///   light differently on each side of a block.
+/// * bit 19 — **[`WAVY`]**: this is a **water** surface, so the blended pass should ripple it.
+///   The one thing that pass cannot work out for itself, because water and glass share it.
 ///
 /// Note the bytes are *brightnesses*, not light levels: the light curve is applied where the
 /// averaging happens (in Rust), so the shaders only multiply. See `world::light`.
 pub const fn pack_light(sky: u8, block: u8, face: usize) -> u32 {
     (sky as u32) | ((block as u32) << 8) | ((face as u32 & 0x7) << 16)
+}
+
+/// The bit in a packed light word that marks a **water** surface (see [`pack_light`]).
+///
+/// Deliberately a bit rather than another parameter to [`pack_light`]: it is not part of the
+/// light at all, and only the mesher ever sets it — see [`wavy`].
+pub const WAVY: u32 = 1 << 19;
+
+/// Mark a packed light word as a water surface, so the blend pass ripples it.
+///
+/// Water and glass are drawn by the same pipeline — both are blended — and a glass pane is
+/// flat, so the surface has to say which it is. That belongs in the vertex, like the face
+/// index, rather than being guessed from a texture layer in the shader.
+pub const fn wavy(light: u32) -> u32 {
+    light | WAVY
 }
 
 /// Full daylight from above, with no light from blocks: open sky, top face. The screen-space HUD
@@ -492,6 +509,21 @@ mod tests {
         // And the other way round: open, sunlit ground with nothing burning nearby.
         assert_eq!(FULL_LIGHT & 255, 255, "daylight");
         assert_eq!((FULL_LIGHT >> 8) & 255, 0, "no block light");
+    }
+    /// The water flag rides in a bit of its own: setting it must leave both brightness bytes and
+    /// the face index exactly as they were, and nothing else may set it by accident.
+    #[test]
+    fn the_water_flag_is_its_own_bit_and_leaves_the_light_alone() {
+        let plain = pack_light(200, 30, 4);
+        assert_eq!(plain & WAVY, 0, "nothing sets it by accident");
+
+        let water = wavy(plain);
+        assert_eq!((water >> 19) & 1, 1, "the shader reads it back");
+        assert_eq!(water & 255, 200, "sky brightness untouched");
+        assert_eq!((water >> 8) & 255, 30, "block brightness untouched");
+        assert_eq!((water >> 16) & 0x7, 4, "face untouched");
+        // Full brightness must not spill into it either — that is the byte next door.
+        assert_eq!(wavy(pack_light(255, 255, 7)) & WAVY, WAVY);
     }
 
     #[test]

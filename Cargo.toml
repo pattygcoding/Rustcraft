@@ -13,3 +13,9 @@ noise = "0.9.0"
 pollster = "1.0.1"
 wgpu = "30.0.1"
 winit = "0.30.13"
+
+[dev-dependencies]
+# wgpu's own WGSL front end, for a test that parses and validates every shader without a GPU.
+# Pinned to the version wgpu 30 already pulls in, so it costs nothing to build and can never
+# disagree with the validator the renderer itself uses.
+naga = { version = "30.0.1", features = ["wgsl-in"] }

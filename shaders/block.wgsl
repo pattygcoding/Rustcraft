@@ -20,6 +20,22 @@ struct Globals {
     // Only the deferred lighting pass reconstructs world positions; the two share one
     // buffer, so this is declared whether or not it is read.
     inv_view_proj: mat4x4<f32>,
+    // Where the sun is, as a unit vector pointing *toward* it (`shadow::direction`). Only the
+    // water's highlight uses it: nothing else in the picture depends on which way the sun faces,
+    // which is why there is no `dot(N, L)` anywhere but here.
+    sun_direction: vec4<f32>,
+    // Where the camera is. The water needs an eye to reflect the sun into, and the uniform is
+    // written once a frame anyway.
+    eye_position: vec4<f32>,
+    // Seconds since the renderer started, for the ripples to drift on, and then the per-frame
+    // view options. The three `f32`s after them are padding: a uniform buffer's size is a multiple
+    // of sixteen bytes, and WGSL's layout for a bare `f32` or `u32` is four.
+    time: f32,
+    // Non-zero while the **full bright** key is held (`N`): light every cell as if it held level
+    // 15, the sea included — see `fs_blend` and `shaders/lighting.wgsl`.
+    full_bright: u32,
+    _pad0: f32,
+    _pad1: f32,
 };
 
 @group(0) @binding(0) var<uniform> globals: Globals;
@@ -52,6 +68,12 @@ struct VertexOutput {
     @location(3) @interpolate(flat) layer: u32,
     @location(4) @interpolate(flat) face: u32,
     @location(5) @interpolate(flat) tint: u32,
+    // Whether this is a water surface — the `mesh::WAVY` bit of the packed shading. Water and
+    // glass share the blended pass, so the surface has to say which it is; a pane is flat.
+    @location(6) @interpolate(flat) wavy: u32,
+    // Where the fragment is in the world. The water's ripples are noise in world space, so that
+    // they belong to the world rather than to each block; everything else ignores this.
+    @location(7) world_position: vec3<f32>,
 };
 
 @vertex
@@ -64,6 +86,8 @@ fn vs_main(vertex: VertexInput) -> VertexOutput {
     out.layer = vertex.layer;
     out.face = (vertex.light >> 16u) & 7u;
     out.tint = vertex.tint;
+    out.wavy = (vertex.light >> 19u) & 1u;
+    out.world_position = vertex.position;
     return out;
 }
 
@@ -125,17 +149,55 @@ fn fs_cutout(in: VertexOutput) -> Surface {
 /// is not bound here. That is a limitation, not a rule: `lit(shade, 1.0)` is exactly the old
 /// formula, because the ambient and direct weights add up to one (see **Shadows** in
 /// AGENTS.md).
+///
+/// **Water is the one surface here that is not flat.** Its ripples are made up in the shading —
+/// a normal built from the height map and from drifting fBm, which then catches the sun — and
+/// the whole of that lives in `shaders/water.wgsl`. Glass shares this pass and skips it: see
+/// `mesh::WAVY`.
 @fragment
 fn fs_blend(in: VertexOutput) -> @location(0) vec4<f32> {
-    let color = textureSample(block_textures, block_sampler, in.uv, i32(in.layer));
+    let sample = textureSample(block_textures, block_sampler, in.uv, i32(in.layer));
     let tint = decode_tint(in.tint);
 
     // Water is lit smoothly like everything else — its corners come from the mesher too — so
     // the sea dims into a shore and a shadow on the bed above it shades the surface as well.
     let shade = face_shade(in.face);
+    // **Full bright** (the `N` key): the sea is lit as if level 15 reached it too, so the water
+    // in a cave is not the one dark thing left in the picture. See `shaders/lighting.wgsl`, which
+    // does the same for everything the opaque pass draws.
+    var sky_brightness = in.sky_brightness;
+    var block_brightness = in.block_brightness;
+    if (globals.full_bright != 0u) {
+        sky_brightness = 1.0;
+        block_brightness = 1.0;
+    }
+
     // No shadow map is bound in this pass, so the sun's side of the light is simply "the sun is
     // not blocked" — but the block light rides along at full strength, so a lava pool seen
     // through water still glows through it.
-    let light = lit_channels(in.sky_brightness * shade, in.block_brightness * shade, 1.0);
-    return vec4<f32>(block_color(color, tint) * light, color.a * tint.a);
+    let light = lit_channels(sky_brightness * shade, block_brightness * shade, 1.0);
+    // The sun's half of that on its own, which is what a highlight on the water belongs to.
+    let sky_light = lit(sky_brightness * shade, 1.0);
+
+    var color = block_color(sample, tint) * light;
+
+    if (in.wavy == 1u) {
+        let eye = globals.eye_position.xyz;
+        let sun = normalize(globals.sun_direction.xyz);
+        // The farther the water is, the coarser the detail that survives — a 16-texel height map
+        // spread over a whole sea would alias into shimmer, and what a sea looks like from far
+        // off is a sheet of reflected sky. So the ripples fade out; the sheen stays.
+        let detail = 1.0 / (1.0 + length(eye - in.world_position) * DETAIL_FADE);
+        let normal = ripple_normal(
+            face_normal(in.face),
+            in.uv,
+            i32(in.layer),
+            in.world_position,
+            globals.time,
+            detail,
+        );
+        color = color + water_glint(normal, in.world_position, eye, sun, sky_light, light);
+    }
+
+    return vec4<f32>(color, sample.a * tint.a);
 }

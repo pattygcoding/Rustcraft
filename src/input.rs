@@ -7,7 +7,8 @@
 //! * WASD to move, Space to jump (or ascend while flying), Shift to sneak (or
 //!   descend while flying), Ctrl to sprint.
 //! * Mouse motion steers the camera; left/right buttons break/place; the wheel and
-//!   the 1–9 keys pick an inventory slot; `E` toggles the creative inventory, and
+//!   the 1–9 keys pick an inventory slot; **the wheel *button* (middle click) picks the block
+//!   being looked at**; `E` toggles the creative inventory, and
 //!   while that is open the screen reads the cursor position and the same buttons.
 //! * **Double-tapping Space toggles flight.**
 //!
@@ -140,7 +141,9 @@ impl Input {
             scroll: self.scroll,
             primary: self.is_mouse_pressed(MouseButton::Left),
             secondary: self.is_mouse_pressed(MouseButton::Right),
+            middle: self.is_mouse_pressed(MouseButton::Middle),
             inventory: self.is_key_pressed(KeyCode::KeyE),
+            full_bright: self.is_key_pressed(KeyCode::KeyN),
             slots: std::array::from_fn(|index| self.is_key_pressed(SLOT_KEYS[index])),
             cursor: self.cursor,
         }
@@ -228,8 +231,15 @@ pub struct PlayerInput {
     pub primary: bool,
     /// Right mouse button held (place/use in the world, pick up/drop on the inventory).
     pub secondary: bool,
+    /// Middle mouse button held — the scroll wheel, pressed: **pick block**, so that the block
+    /// being looked at becomes the one you would place. See `Inventory::pick_block`.
+    pub middle: bool,
     /// `E` held: toggles the creative inventory.
     pub inventory: bool,
+    /// `N` held: **full bright** — light every cell as if it held level 15, so the caves and the
+    /// underside of every overhang are as visible as open ground. A view option and nothing more:
+    /// it changes no block and no chunk, only which light the picture is drawn with.
+    pub full_bright: bool,
     /// The 1–9 keys, in slot order.
     pub slots: [bool; 9],
     /// Cursor position in physical pixels, for the inventory screen.
@@ -311,5 +321,24 @@ mod tests {
     #[test]
     fn wheel_line_delta_is_ticks() {
         assert_eq!(wheel_ticks(&MouseScrollDelta::LineDelta(0.0, 2.0)), 2.0);
+    }
+
+    /// Holding `N` asks for **full bright**, and letting it go asks for the ordinary light again.
+    ///
+    /// The key is read straight out of the held set — the way every other held key is — so a
+    /// release is all it takes to put the world back, and nothing has to remember a mode.
+    #[test]
+    fn holding_n_asks_for_full_bright() {
+        let mut input = Input::new();
+        assert!(!input.snapshot().full_bright, "off until the key is held");
+
+        input.keys.insert(KeyCode::KeyN);
+        assert!(input.snapshot().full_bright, "held, so the caves are lit");
+
+        input.release_all();
+        assert!(
+            !input.snapshot().full_bright,
+            "and off the moment it is let go"
+        );
     }
 }

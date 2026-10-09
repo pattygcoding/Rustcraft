@@ -252,26 +252,35 @@ pub struct BlockTextures {
 }
 
 impl BlockTextures {
-    /// Load every `*.png` in `dir` into a texture array.
+    /// Load every `*.png` under each of `dirs` into one texture array.
+    ///
+    /// Several directories, because **items share the array with blocks**: a bucket is drawn by
+    /// the same pipeline, the same bind group and the same sampler as a block face, so it is a
+    /// layer like any other — `assets/textures/blocks` and `assets/textures/items`.
     ///
     /// Files are read in sorted order so layer indices are stable between runs,
-    /// and the file stem (name without `.png`) is the lookup key, e.g.
-    /// `grass_block_top`.
+    /// and the file stem (name without `.png`) is the lookup key, e.g. `grass_block_top`
+    /// or `water_bucket`.
     ///
     /// # Panics
     ///
-    /// Panics if the directory cannot be read or a PNG cannot be decoded — a
+    /// Panics if a directory cannot be read or a PNG cannot be decoded — a
     /// missing texture should fail loudly at startup, not silently render wrong.
-    pub fn load(device: &wgpu::Device, queue: &wgpu::Queue, dir: impl AsRef<Path>) -> Self {
-        let dir = dir.as_ref();
-        let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)
-            .unwrap_or_else(|err| panic!("cannot read texture dir {}: {err}", dir.display()))
-            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-            .filter(|path| {
-                path.extension()
-                    .is_some_and(|ext| ext.eq_ignore_ascii_case("png"))
-            })
-            .collect();
+    pub fn load(device: &wgpu::Device, queue: &wgpu::Queue, dirs: &[&Path]) -> Self {
+        let mut paths: Vec<PathBuf> = Vec::new();
+        for dir in dirs {
+            paths.extend(
+                std::fs::read_dir(dir)
+                    .unwrap_or_else(|err| {
+                        panic!("cannot read texture dir {}: {err}", dir.display())
+                    })
+                    .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+                    .filter(|path| {
+                        path.extension()
+                            .is_some_and(|ext| ext.eq_ignore_ascii_case("png"))
+                    }),
+            );
+        }
         paths.sort();
 
         let mut layers = HashMap::new();
@@ -286,9 +295,9 @@ impl BlockTextures {
             images.push(load_layer(path));
         }
         log::info!(
-            "loaded {} block textures from {}",
+            "loaded {} textures from {} directories",
             images.len(),
-            dir.display()
+            dirs.len()
         );
 
         let array = TextureArray::new(device, queue, "block-textures", TEXTURE_SIZE, &images);
@@ -314,16 +323,62 @@ impl BlockTextures {
 }
 
 /// Load a PNG as an RGBA image resized to [`TEXTURE_SIZE`].
+///
+/// A PNG that is a **frame strip** — a whole number of squares stacked one above the other, as
+/// the animated water and lava textures are — contributes its *first* frame. Squashing a 16×512
+/// sheet into one 16×16 tile is not a small version of the picture, it is a different picture:
+/// for those blocks it reads as fine banding, and the water's is the height the shader takes its
+/// ripples from.
 fn load_layer(path: &Path) -> image::RgbaImage {
     let image = image::open(path)
         .unwrap_or_else(|err| panic!("cannot load texture {}: {err}", path.display()));
     let rgba = image.to_rgba8();
-    resize_to(&rgba, TEXTURE_SIZE).into_owned()
+    let frame = {
+        let (width, height) = frame_size(rgba.width(), rgba.height());
+        if (width, height) == rgba.dimensions() {
+            std::borrow::Cow::Borrowed(&rgba)
+        } else {
+            std::borrow::Cow::Owned(
+                image::imageops::crop_imm(&rgba, 0, 0, width, height).to_image(),
+            )
+        }
+    };
+    resize_to(&frame, TEXTURE_SIZE).into_owned()
+}
+
+/// The size of the region one texture contributes: the whole image, or one frame's square if the
+/// image is a **frame strip** — taller than it is wide by a whole number of times, so 16×512 is
+/// thirty-two 16×16 frames.
+///
+/// Only the first frame is used for now; moving between them is what
+/// [`TextureArray::update_layer`] is for.
+fn frame_size(width: u32, height: u32) -> (u32, u32) {
+    if width > 0 && height > width && height.is_multiple_of(width) {
+        (width, width)
+    } else {
+        (width, height)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A PNG taller than it is wide by a whole number of times is a frame strip, and only its
+    /// first frame is loaded — a plain texture is loaded whole.
+    #[test]
+    fn a_frame_strip_contributes_its_first_frame() {
+        // The animated blocks' real sizes.
+        assert_eq!(frame_size(16, 512), (16, 16), "thirty-two 16x16 frames");
+        assert_eq!(frame_size(32, 1024), (32, 32), "and 32x32 ones");
+        // A texture that is not a strip is itself.
+        assert_eq!(frame_size(16, 16), (16, 16));
+        assert_eq!(frame_size(32, 16), (32, 16), "wide is not a strip");
+        assert_eq!(frame_size(16, 40), (16, 40), "nor is two and a half frames");
+        assert_eq!(frame_size(0, 0), (0, 0), "and nothing stays nothing");
+        // Exactly two frames counts.
+        assert_eq!(frame_size(16, 32), (16, 16));
+    }
 
     #[test]
     fn mip_levels_halve_down_to_a_single_texel() {

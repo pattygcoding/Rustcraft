@@ -11,10 +11,19 @@
 // light curve and the face shade are the same ones the water and the HUD use.
 
 // Matches `Globals` in `gfx::renderer`: one buffer, shared with the passes that project
-// geometry, so both fields are declared even though only one is read here.
+// geometry. The water's sun, eye and clock are not read here — but a uniform buffer is bound
+// whole, so they have to be *declared* for the switch below to land where the CPU put it:
+// WGSL lays a struct out from its own declaration, and a field that moved on one side would
+// not fail to compile, it would quietly read the wrong bytes.
 struct Globals {
     view_proj: mat4x4<f32>,
     inv_view_proj: mat4x4<f32>,
+    sun_direction: vec4<f32>,
+    eye_position: vec4<f32>,
+    time: f32,
+    // Non-zero while the **full bright** key is held (`N`): light every cell as if it held level
+    // 15, whatever it really holds. See `fs_lighting`.
+    full_bright: u32,
 };
 
 // Matches `shadow::SunUniform`.
@@ -124,6 +133,18 @@ fn fs_lighting(@builtin(position) pixel: vec4<f32>) -> @location(0) vec4<f32> {
     let stored = textureLoad(albedo_buffer, texel, 0);
     let properties = textureLoad(normal_buffer, texel, 0);
     let normal = properties.rgb * 2.0 - 1.0;
+    let shade = face_shade(face_of_normal(normal));
+
+    // **Full bright** — the `N` key held down — lights every cell as if it held level 15: the
+    // brightness the mesher bakes for a cell out in the open. The sun's shadow goes with it,
+    // because a shadow is the one thing left that could darken a fully-lit cell, which is the
+    // whole point *and* the whole of what this mode is for: a cave as readable as open ground.
+    // The *face* shade stays, since that is what makes a cube read as a cube rather than a flat
+    // sheet of its own texture.
+    if (globals.full_bright != 0u) {
+        return vec4<f32>(stored.rgb * lit_channels(shade, shade, 1.0), 1.0);
+    }
+
     let world = world_at(pixel.xy, depth);
 
     // The light the geometry pass left behind, per channel: the albedo's alpha holds the sky
@@ -135,7 +156,6 @@ fn fs_lighting(@builtin(position) pixel: vec4<f32>) -> @location(0) vec4<f32> {
     // it is kept apart all the way to here. The face shade rides along as the old per-side
     // darkening that makes a cube read as a cube.
     let shadow = sun_visibility(world, normal);
-    let shade = face_shade(face_of_normal(normal));
     let light = lit_channels(stored.a * shade, properties.a * shade, shadow);
     return vec4<f32>(stored.rgb * light, 1.0);
 }

@@ -1,0 +1,18 @@
+{
+  "block.air": "Air",
+  "block.grass_block": "Grass Block",
+  "block.dirt": "Dirt",
+  "block.stone": "Stone",
+  "block.bedrock": "Bedrock",
+  "block.water": "Water",
+  "block.lava": "Lava",
+  "block.glass": "Glass",
+  "block.oak_log": "Oak Log",
+  "block.oak_planks": "Oak Planks",
+  "block.oak_leaves": "Oak Leaves",
+  "block.poppy": "Poppy",
+  "block.dandelion": "Dandelion",
+  "item.bucket": "Bucket",
+  "item.water_bucket": "Water Bucket",
+  "item.lava_bucket": "Lava Bucket"
+}

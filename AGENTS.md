@@ -34,14 +34,26 @@ of `(seed, position)` like the terrain, so caves cross chunk borders seamlessly 
 chunks either side arrive from different threads.
 Chunks are meshed with **cross-chunk hidden-face culling** into one mesh
 (one draw call) each, drawn from individual PNGs in a `texture_2d_array` (no atlas).
-A first-person fly camera; **right-click breaks** and **left-click places** the
-block the camera is looking at (a voxel raycast), placed from **nine inventory slots**
-chosen with `1`–`9` or the wheel. A **crosshair** marks the middle of the screen — where a
-click's raycast starts, so it is the block being broken or placed — and hides while the
-creative screen is open. `E` opens a **creative inventory** where every block
-— grass, dirt, stone, oak log, oak planks, oak leaves, poppy, dandelion, glass, **lava**, water
-and bedrock — is drawn as a little 3D cube: click one to pick it up, click a slot to
-drop it in. The renderer is **deferred** (see **Rendering**): the world is drawn into a
+A first-person fly camera; **right-click breaks** and **left-click uses what is in hand** on the
+block the camera is looking at (a voxel raycast), held in **nine inventory slots**
+chosen with `1`–`9` or the wheel — or picked straight off the world with the **wheel button**,
+which makes what you are aimed at the thing in hand. A **crosshair** marks the middle of the
+screen — where a click's raycast starts, so it is the block being broken, used or picked — and
+hides while a screen
+stands between the player and the world. `E` opens a **creative inventory** where everything you
+can hold — grass, dirt, stone, oak log, oak planks, oak leaves, poppy, dandelion, glass,
+**bedrock** and three **buckets** — is drawn as a little 3D cube, or as its own sprite in the
+case of a bucket: click one to pick it up, click a slot to
+drop it in. **Buckets** are how the fluids move: a bucket of water or lava pours it into the
+world (and is left empty), and an empty bucket scoops a fluid back out — so water and lava are
+never held as blocks at all (see **Buckets**). A **caption** above the row names what you are
+holding for a moment whenever it changes, and the creative screen's tooltip names what the cursor
+is over — both of them reading the labels out of `resources/assets/lang/en.json`, the one language
+file (see **The language**). `Esc` opens a **pause menu** — **Continue** or **Exit** — which freezes the world
+and takes the cursor while it is up, and whose labels come from a hand-rolled 5×7 **bitmap
+font** drawn as flat quads (see **Controls**). The creative screen is a card with a bevelled title
+bar and slots, and a tooltip naming whatever the cursor is over; see the HUD paragraph in
+**Interaction**. The renderer is **deferred** (see **Rendering**): the world is drawn into a
 G-buffer and lit in one fullscreen pass, in **two light channels** (see
 **Emissive blocks & block light**): **Minecraft-style sky lighting (levels 0–15)**
 — which darkens overhangs and caves, and is *all* the light in a cave — is the *ambient* half,
@@ -52,7 +64,11 @@ light** lava emits is the other, which no shadow may take away, so *a lava pool 
 cave around it* — the picture that shows the two channels earning their keep. The sky's other
 half is a **shadow map**: the same chunk meshes drawn once from the sun's point of view, so
 trees, cliffs and walls cast real shadows, thrown west because the sun sits high in the east
-(see **Shadows**). See **Textures & blocks** (incl. **Lighting** and **Transparency**),
+(see **Shadows**). Holding **`N`** lights the whole world — caves and overhangs included — as if
+every cell held level 15, a *view* option for looking around in the dark (see **Lighting**). The sea is the one surface with a shader of its own: its ripples are a normal
+built from the water's own texture read as a height map, plus drifting **fBm**, and the sun catches
+it — a highlight and a sheen of sky (see **Transparency**). See **Textures & blocks** (incl.
+**Lighting** and **Transparency**),
 **Terrain** (incl. **Caves & ravines**) and **Chunks & meshing**. Next: greedy meshing, player
 physics, biomes.
 
@@ -66,8 +82,9 @@ physics, biomes.
 | GPU buffer casting | `bytemuck` | 1.25 | `#[derive(Pod)]` for safely uploading vertex/uniform structs to the GPU. |
 | Async block-on | `pollster` | 1.0 | Block on wgpu's `async` init calls from a synchronous `main`. |
 | Logging | `log` + `env_logger` | 0.4 / 0.11 | wgpu/winit log through the `log` facade; `env_logger` prints them, filtered by `RUST_LOG`. |
-| Procedural noise | `noise` | 0.9 | Perlin/Simplex/OpenSimplex for terrain generation. (Not wired up yet.) |
-| Textures | `image` | 0.25 | Load PNG block textures for the atlas. (Not wired up yet.) |
+| Procedural noise | `noise` | 0.9 | Perlin/Simplex/OpenSimplex; the terrain is a `Fbm<Perlin>` field. |
+| Textures | `image` | 0.25 | Load the PNG block textures (one `texture_2d_array` layer each). |
+| Shader validation | `naga` (dev) | 30 | wgpu's own WGSL front end, for a test that parses and validates every shader with no GPU. Already in the tree as wgpu's dependency, so it costs nothing to build and can never disagree with the validator the renderer uses. |
 
 **Why not Bevy?** A full engine would hide the voxel-rendering and chunk-meshing
 work that is the point of this project, and adds a large dependency tree. We want
@@ -80,6 +97,11 @@ src/
   main.rs          Entry point: logging, `winit` event loop, the `App` handler.
   camera.rs        `Camera`: first-person fly camera (view/projection matrices).
   inventory.rs     `Inventory`: nine slots, the creative screen (`E`), HUD geometry.
+  item.rs          `Item`: what a slot holds — a block, or a bucket.
+  lang.rs          `Lang`: the labels, read from `assets/lang/en.json`.
+  pause.rs         `PauseMenu`: the screen `Esc` opens — Continue or Exit.
+  font.rs          A 5×7 bitmap font, drawn as flat quads (the menu's labels).
+  ui.rs            `Rect`, `push_rect` and `push_bevel`: the primitives every HUD screen shares.
   gfx/
     mod.rs         Graphics module root + re-exports.
     context.rs     `GraphicsContext`: wgpu instance/device/queue/surface + resize.
@@ -100,12 +122,15 @@ src/
     mesher.rs      `mesh_chunk`: emits only visible faces (hidden-face culling).
 shaders/
   sun.wgsl         Shared prelude: face shade, the sun/ambient mix, tint maths.
+  water.wgsl       Water surface: fBm ripples and a normal from the height map.
   block.wgsl       Block geometry (into the G-buffer), plus the blended water pass.
   lighting.wgsl    Deferred pass: lights the G-buffer in one fullscreen triangle.
   shadow.wgsl      The shadow pass: depth only, and no fragment shader at all.
-  ui.wgsl          Screen-space HUD shader (the crosshair and the hotbar).
+  ui.wgsl          Screen-space HUD shader (the crosshair, the hotbar and the screens over it).
 resources/
   assets/textures/blocks Individual block PNGs (one array layer each).
+  assets/textures/items  Item sprites (buckets), in the same array.
+  assets/lang/en.json    What the HUD calls every block and item.
 Cargo.toml         Dependencies (edition 2024).
 AGENTS.md       This file.
 README.md       Short human-facing overview.
@@ -203,7 +228,16 @@ Rules of the road:
 
 * **Add a texture:** drop `my_block.png` into `resources/assets/textures/blocks`. It is
   addressed by its file stem: `textures.layer("my_block")`. Layer indices are
-  assigned in sorted file order, so they are stable between runs.
+  assigned in sorted file order, so they are stable between runs. **Item sprites go in
+  `resources/assets/textures/items`** and become layers of the *same* array — a bucket is drawn
+  by the same pipeline as a block face, so it needs no array of its own.
+* **Animation strips load their first frame.** A PNG taller than it is wide by a whole number of
+  times is a sequence of frames stacked one above the other — `water_still.png` is 16×512, which
+  is thirty-two 16×16 frames — and `texture::frame_size` takes the top square of it. Without that
+  a 16×512 sheet is *squashed* into one 16×16 tile, which is not a smaller version of the picture
+  but a different one: fine banding, and — since the water takes its ripples from that texture's
+  height — noise instead of ripples. Moving between the frames is what
+  `TextureArray::update_layer` is for, and is still to come.
 * **Mipmaps are automatic:** each layer is uploaded as its own mip pyramid
   (`texture::downsample`, a box filter that averages *alpha* as well as colour), and the
   sampler filters nearest *within* a level and linear *between* them. A distant block
@@ -319,6 +353,28 @@ second light costs one more byte carried through the buffers, not another pass.
 A flower is lit flat by its own cell, having no corners that meet anything; and light does not
 cross chunk borders, so a smoothed gradient stops at a chunk seam where a shadow straddles it.
 
+**Full bright** — the `N` key, held down — is the one thing that skips all of that. While it is
+held, every cell is lit as if it held **level 15**: a cave, an overhang's underside and open
+ground all come out at the brightness the mesher would have baked for a cell in the sun. It is a
+*view* option and nothing more — it changes no block, no chunk and no baked light, only the number
+the picture is drawn from — which is why it lives in the per-frame uniform (`Globals.full_bright`)
+rather than in the mesher or the vertex data: the light is still in the vertices, and the lighting
+pass simply declines to read it.
+
+Two things go with it, and both are deliberate:
+
+* **The sun's shadow goes too.** A shadow is the one thing left that could darken a fully-lit
+  cell, and the mode exists to *read* a cave, so the lighting pass skips the shadow lookup
+  entirely — which is also why it can return early, without even reconstructing a world position
+  from the depth (that exists only to ask the shadow map).
+* **The face shade stays.** Top 1.0, sides 0.6–0.8, bottom 0.5 is what makes a cube read as a cube
+  rather than a flat sheet of its own texture, and level 15 does not take it away: the pass is
+  handed `shade` twice, once per channel, instead of the baked brightness the corners carry.
+
+Water is lit by the *blend* pass rather than this one, so it has to ask for the same thing
+separately (`fs_blend` in `block.wgsl`) — otherwise the sea in a cave would be the one dark thing
+left in a full-bright picture. The HUD needs nothing: it was never lit.
+
 ### Emissive blocks & block light
 
 Some blocks *make* light rather than merely letting it through, and that light has to be kept
@@ -357,9 +413,11 @@ Why a second channel earns its keep:
 
 Two things to be careful of when adding a block like this. *Emitting* and *letting light through*
 are different questions: lava is **opaque** (`is_opaque`), so neither channel passes through it —
-light pours *out* of it instead, and it hides the faces behind it like stone. And a fluid is not
+light pours *out* of it instead. And a fluid is not
 automatically a source: water lets block light through while emitting none of its own, and lava
-emits while letting none through.
+emits while letting none through. Being opaque to light is not the same as being opaque *to face
+culling*, either: lava does not fill its cell, so it hides only faces of its own kind (see
+**Transparency**).
 
 Known limits: lava is the only emitter (the whole palette is in the creative screen's, and the
 world's only block light is the lava sea at the bottom of it — see **Caves & ravines**), and none of
@@ -478,9 +536,9 @@ hides a face, a see-through one hides only faces of its own kind. So the sea has
 faces between its own cells, while the seabed *is* drawn — and seen — through the
 water; a wall of glass has no seam through it either. Leaves hide nothing at all: a
 leaf face is kept even against another leaf, because culling those would let you see
-straight through the canopy. **Lava is opaque**, so a pool has no faces inside it and hides
-whatever stands behind it — but water hides only water, so lava under the sea is still drawn
-(*and seen*) through it.
+straight through the canopy. **The fluids hide only their own kind** — a pool has no faces
+inside it — and the *rock* beside a pool, and the rock over it, keep their faces rather than
+being culled by it. That last rule is what keeps a pool's waterline honest: see below.
 
 Cross sprites are exempt outright: `hides_face_of` only hides a face when the block
 being drawn *fills its cell* (`Block::is_full_cube`), and a flower's planes lie flush
@@ -502,7 +560,79 @@ have no seam in them — and `push_face` shortens only a face's *upper* edge, so
 floor still rests on the block below. A face's texture, light, tint and height travel
 together as a `FaceStyle`.
 
-Still to come: an underwater fog/overlay (`water_overlay.png`), and sorting the
+That shortened surface is also why a **fluid hides nothing but its own kind** (see the face
+culling above). The slice above the surface is empty — nothing is drawn there — so a face a
+fluid had culled would leave a two-pixel slit along the top of the pool with no face across it
+at all, and the neighbour's *missing* face would show through it: the rock at the waterline, or
+the rock a pool sits under, would read as transparent. A fluid therefore hides only its own
+kind, which stops short in exactly the same way and so still lies flush against it, and every
+other face around a pool stands. Lava alone used to be the exception — opaque, and so culled
+like stone — and that is precisely the case that showed the seam. The price is triangles rather
+than pixels: the rock around a lava sea keeps faces that a pool's own geometry then hides, about
+**+12%** of the patch's faces measured over six chunks, all of them occluded.
+
+### The water surface
+
+Water is the one surface in the world that is not flat, and the one thing the renderer cannot
+fake with geometry: a sea is one quad per block, a hair short of its cell, so *every* ripple has
+to be made up in the shading. `shaders/water.wgsl` (pasted into `block.wgsl`, since `fs_blend` is
+where water is drawn) does exactly that — it builds a normal for the surface, and the light
+sends it back as a glint.
+
+The normal is the facet's own, tilted by two slopes added together:
+
+* **The water height map**, which is the water texture itself. It is greyscale and takes its
+  colour from the block's tint, so its brightness is a height and a central difference across a
+  texel is the slope of the surface — a bump map, in other words, sampled at mip level 0 because
+  the finest ripples are the point, and wrapped by the sampler's `Repeat` rather than flattening
+  at the tile's edge. **The ripples you can see drawn on the water are therefore the ripples that
+  catch the light.** The strength is calibrated to that texture, and to a measurement: its slopes
+  are gentle (a texel differs from its neighbour by 0.04 of the range on average), so
+  `BUMP_STRENGTH` is 8 — at 2 the tilt would be under five degrees and invisible.
+* **fBm**, four octaves of value noise over a hash, sampled in *world* space and scrolled with
+  time. World space because the pattern should belong to the world rather than to each block —
+  otherwise the sea would visibly repeat every block — and scrolled because water is never still.
+  The hash works on the *bits* of the coordinates, not on their values, so the pattern is the same
+  on every GPU: a `sin`-based one is only as good as the driver's sine, and a ripple pattern that
+  differed between drivers would be a bug nobody could chase.
+
+Both fade out with distance (`DETAIL_FADE`), which is not only taste: a 16-texel height map spread
+over a whole sea aliases into shimmer, and what a sea looks like from far off is a sheet of
+reflected sky anyway.
+
+The tilted normal then earns its keep twice, and neither is a shadow — there is no shadow map in
+this pass:
+
+* a **highlight** where the sun's reflection lines up with the eye (a tight `pow(dot(N, H), 48)`,
+  so it lands as sparkles where a ripple happens to catch the sun rather than as a sheen over
+  everything), scaled by the *sky* half of the light, because a pool lit by lava in a cave should
+  not catch a sunbeam;
+* a **sheen** of sky at grazing angles — `SHEEN_COLOR` is the colour the renderer clears to, and
+  this is the part that makes a sea seen from a low angle read as sky rather than as water.
+
+That needed three things in the uniform the passes share (`Globals`): `sun_direction`
+(`shadow::direction`, the same vector the shadow box is built from), `eye_position`, and `time`.
+The same uniform carries the `full_bright` switch the `N` key sets — every pass that lights
+something reads it (see **Lighting**).
+It is also why binding 0 is `VERTEX_FRAGMENT` rather than vertex-only, and why the layout is
+pinned by a test — a uniform whose fields moved on one side would not fail to compile, it would
+quietly light the water with the wrong numbers. Worth being explicit about the scope: **this is
+the only `dot(N, L)` in the renderer.** The rest of the world is lit without asking which way the
+sun faces (see **Shadows**), and the water does not change that.
+
+The other half of the water's look is which blocks ripple. Water and glass share the blended pass,
+and a pane is flat, so the surface has to say which it is: the mesher marks a water face with
+[`mesh::WAVY`] — bit 19 of the packed light word, beside the two brightness bytes and the face
+index — and `fs_blend` ripples only what carries it. One bit, and `Block::ripples()` is the one
+place that decides who gets it.
+
+Known limits: the water's side faces ripple too (they are the waterline, and it reads as a lip of
+water rather than as a mistake); the highlight cannot be shadowed, for the same reason everything
+else in this pass cannot (the map is not bound here); and the ripples are shading only — the
+surface itself never moves.
+
+Still to come: an underwater fog/overlay (`water_overlay.png`), the water texture *animating*
+between the frames of its strip (see **Textures & blocks**), and sorting the
 translucent *faces within* a chunk — with one flat sea at `SEA_LEVEL` at most one
 translucent surface lies along any view ray, so chunk ordering is enough for now.
 
@@ -597,7 +727,8 @@ pool rather than a pit. That is where the world's block light comes from: the la
 15 and `Chunk::relight` spreads it up the shaft (see **Emissive blocks & block light**).
 
 What a carver may cut is short by design — `Block::is_carveable` is **stone and soil and nothing
-else**. Bedrock keeps the floor of the world solid however deep a worm goes; a cave opening into
+else**. Bedrock keeps the floor of the world solid however deep a worm goes — *carving* may not cut
+it, though the player may still break it (see **Interaction**); a cave opening into
 the sea does not drain it (nothing flows), and lava is a source rather than something to tunnel
 through; and wood is not rock, so a ravine cuts *around* an oak and a tree whose ground a cave
 opens keeps standing. (Trees are planted with the columns, *before* the carvers, precisely so that
@@ -737,12 +868,17 @@ cargo test                  # unit/integration tests
 
 Notes:
 
-* Tests live beside the code they cover (`mod tests`), and there are ~120 of them — mostly pure
+* Tests live beside the code they cover (`mod tests`), and there are ~145 of them — mostly pure
   logic (world gen, the carvers, meshing, lighting, raycasting, chunk maths, the HUD's layout and
   hit tests). Add them alongside new pure logic; the streaming decisions are pure functions
   (`missing_chunks`, `can_mesh`) precisely so they can be tested without threads, and the carvers
   are pure functions of `(seed, origin)` for the same reason — which is what lets a test carve the
   same worm from either side of a chunk border and compare the cells.
+* **Shaders are tested too.** WGSL is a string as far as `rustc` is concerned, so a typo in one is
+  otherwise only found when the game opens a window: `renderer::tests` hands every composed shader
+  to `naga` — wgpu's own front end, already in the tree as its dependency — to be parsed and
+  validated, and pins the `Globals` layout the CPU and GPU halves have to agree on. A new shader or
+  a new uniform field belongs in those two tests.
 * `RUST_LOG` controls verbosity (e.g. `RUST_LOG=rustcraft=debug,wgpu=warn`).
   The app's own messages use the `rustcraft` target. `rustcraft=debug` also prints the chunk
   streaming numbers — mesh time per frame, chunks generated, and any frame over 33 ms.
@@ -777,57 +913,174 @@ Notes:
 | `Shift` | Move down |
 | `Space` ×2 (double-tap) | Toggle flight (faster movement) |
 | `Ctrl` | Sprint (speed multiplier) |
-| `Esc` | Release the cursor |
-| Left click | Place the selected block (or grab the cursor when it is free) |
+| `N` (held) | **Full bright**: light every cell as if it held level 15, so caves and overhangs are as visible as open ground |
+| `Esc` | Open/close the pause menu (Continue / Exit) |
+| Left click | Use what is in hand: place a block, or pour/fill a bucket (or grab the cursor when it is free) |
 | Right click | Break the block the camera is looking at |
 | Scroll wheel | Cycle the nine inventory slots |
+| Middle click (the wheel pressed) | **Pick block**: what is being looked at becomes the thing in hand — a fluid being picked as its bucket |
 | `1`–`9` | Choose a slot — or, on the creative screen, stock that slot with the block under the cursor |
 | `E` | Open/close the creative inventory (and hand the cursor over with it) |
 
 Held keys are tracked in a set and cleared when the window loses focus; mouse
 look uses raw `DeviceEvent::MouseMotion` so it keeps working while the cursor is
 grabbed; auto-repeat is ignored for double-tap detection. The cursor is grabbed
-on startup — `Esc` frees it, a left click grabs it again.
+on startup — `Esc` opens the pause menu and so frees it, and *Continue* (or `Esc`
+again) grabs it back.
 
 **Block editing** raycasts from the camera through the voxel grid
 (`World::raycast`, an Amanatides–Woo DDA) up to `REACH` (6) blocks, returning the
 block hit *and* the face it was entered through — the first block the ray can actually
-*hit*, the fluids being transparent to it. **Right-click breaks** it; **left-click
-places** the selected block in the free cell against that face. Edits go through
-`World::set_block`, which marks the chunk — and any touched border neighbour — dirty
-for re-meshing. Bedrock is unbreakable, so you cannot mine through the bottom, and neither
-fluid can be broken: you build over water, and you bury lava — which is also the one edit that
-turns light *on* rather than off, since `set_block` relights the chunk (see
+*hit*, the fluids being transparent to it. **Right-click breaks** it; **left-click uses what
+is in hand** — see **Buckets** below; **the wheel button picks what is being looked at**.
+Edits go through `World::set_block`, which marks the chunk — and any touched border neighbour —
+dirty for re-meshing. **Bedrock can be broken like anything else** — there is no survival mode to
+be kept out of the bottom of the world with, so the floor is the player's to take apart (breaking
+and *carving* are different questions: the carvers still leave it alone, see **Caves & ravines**) —
+while neither fluid can be broken: you build over water, and you bury lava — which is also the one
+edit that turns light *on* rather than off, since `set_block` relights the chunk (see
 **Emissive blocks & block light**).
+
+### Buckets
+
+A slot does not hold a [`Block`] — it holds an **`Item`** (`src/item.rs`), which is either a
+block, drawn as a little cube and placed as a block, or one of the three buckets, drawn as a
+flat sprite and *used* on the world. Buckets are the reason that distinction exists: **water and
+lava are not blocks you can hold.** They are not on the creative palette; they live in the two
+buckets, and a bucket is the only thing that can put one into the world or take one out of it.
+
+- **A full bucket** pours. Left-click, and the fluid lands in the cell the ray enters — the same
+  cell a block would be placed in — and the slot is left holding the **empty bucket** it came
+  from. One pour per bucket.
+- **An empty bucket** fills. Left-click at water or lava and the fluid is taken *out of the
+  world*, with the full bucket left in hand. It is the exact inverse of pouring, and
+  `Item::pours`/`Item::bucket_of` are the two halves of the one mapping, so they cannot drift.
+- **A bucket is not picky about which fluid**, and nothing flows here: every fluid cell is a
+  *source*, so there is no half-empty water to refuse. That is why filling needs no test beyond
+  "is it a fluid".
+
+Filling needed the second raycast. `World::raycast` looks *through* fluids — that is what makes
+right-click break the ground under the sea rather than the sea — so a bucket would never find the
+water it was held over. `World::raycast_anything` is the same DDA with a wider stop: it takes the
+**nearest thing of either kind**, a block or a fluid, which is exactly what a bucket should act
+on. It also means nothing can be scooped through a wall, and **pick block** uses it too: pick a
+fluid and you get its bucket, the way Minecraft's pick does, because what the crosshair is on is
+the water and not the sand beneath it.
 
 **Inventory**: `src/inventory.rs` holds nine quick-access slots and the creative
 screen. Slots are chosen with `1`–`9` or the wheel; `E` opens the screen, which shows
-every block you can place (grass, dirt, stone, oak log, oak planks, oak leaves, poppy,
-dandelion, glass, lava, water, bedrock). Clicking a palette block picks it up, clicking a
+everything you can hold (grass, dirt, stone, oak log, oak planks, oak leaves, poppy,
+dandelion, glass, the three buckets, bedrock). Clicking a palette entry picks it up, clicking a
 slot drops it in, and hovering one and pressing `1`–`9` stocks that slot directly —
-the way Minecraft does it. The screen takes the cursor while it is open (`App` grabs
-and releases it with the toggle), and the world ignores mouse-look, clicks and the
+the way Minecraft does it. **`Inventory::pick_item`** is the other way in: a slot that already
+holds the item being looked at is *selected*, and otherwise the item replaces whatever the
+selected slot held — so the row is a set of things you have, reaching for one of them does not
+disturb the others, and what is in hand is always what you were just looking at. Only buckets
+are consumed, and they come straight back as their other half, so this is otherwise a creative
+inventory. The screen takes the cursor while it is open
+(`App` grabs and releases it with the toggle), and the world ignores mouse-look, clicks and the
 wheel until it closes.
 
 The HUD is drawn by the renderer as screen-space geometry (`shaders/ui.wgsl` — a 2D
-pipeline that reuses the block texture array and bind group). A slot's block is drawn
+pipeline that reuses the block texture array and bind group). A slot's **block** is drawn
 by `gfx::mesh::BlockIcon`: a fixed 45°-yaw, 30°-tilt axonometric projection of the unit
 cube, which hands the top and its two visible sides to the *existing* `CUBE_FACES`
 corners — so each face keeps its real texture (the log shows rings on top and bark on
 the sides) and its real directional shading, because `ui.wgsl` reads the face index the
 mesher packs into the light for exactly this. Cross sprites (poppy, dandelion) are
-drawn as the flat sprites they are. A `mesh::NO_TEXTURE` layer sentinel lets the panel
+drawn as the flat sprites they are — and so is a **bucket**, which is an `Item` rather than a
+block: `Item::sprite` names its layer, and `inventory::push_item` draws one quad for it, in the
+same box the cube would have filled. That is the whole of what the item/block split costs the
+HUD, and it is why `BlockTextures::load` takes *two* directories: the sprites are layers of the
+same array, because they ride the same pipeline, bind group and sampler. A `mesh::NO_TEXTURE`
+layer sentinel lets the panel
 and highlights ride the same pipeline with no texture at all: the tint *is* the colour.
-`Layout` places every cell *and* answers what the cursor is over, so the drawing and the
-hit test cannot drift apart — a test asserts nothing lands off screen.
+
+**The screen's look** is one idea, applied twice: a slot is a *recessed box*, and the card it sits
+on is a raised one. `ui::push_bevel` draws a rectangle with its rim — dark along the top and left
+where a hollow turns away from the light, light along the bottom and right — which is the whole
+difference between a grid of squares and a grid of slots; the card, its title bar and the slot in
+hand are the same call with different colours and the bevel the other way round. Across the top
+sits a **title bar** with the screen's name in the bitmap font, and under the cursor a **tooltip**
+names whatever it is over — `lang.label_of_item` — on a small dark plate, so the screen says what
+it is and what you are pointing at rather than leaving you to work it out from a picture. The
+plate is placed by `inventory::tooltip_rect`, which sizes itself to the text
+and slides back inside the screen near an edge, so a cell in the corner still gets a readable
+label. `Layout` places every cell *and* answers what the cursor is over, so the drawing and the
+hit test cannot drift apart — a test asserts nothing lands off screen. **How much of a slot an
+icon fills** is `inventory::icon_half`: the cube is 1.0 wide and about 1.11 tall *in the same
+units*, and a slot is square in **pixels** while NDC is not, so the two axes take scales that
+differ by the aspect ratio — the adjustment every square cell makes — and the icon is then sized
+so its height fills the slot. One scale on both axes is what once squashed the icons flat, the
+blocks' sides crushed to a sliver under the top face and the whole model reading as a third of
+the slot; two tests pin the icon's shape and its size in pixels.
 
 The **crosshair** rides that pipeline too: four `NO_TEXTURE` bars — a white cross drawn over
 a slightly larger dark one, so it reads against bright sky and dark stone alike — centred on
 the screen and measured in NDC like the rest of the HUD, with a hole in the middle so the
-pixel being aimed at stays visible. It is drawn only while the creative screen is *closed*,
-since that is when the world is aimed at. Sizing it by NDC rather than pixels hides a trap: on
+pixel being aimed at stays visible. It is drawn only while nothing stands between the player
+and the world — the creative screen and the pause menu both take it away — since that is when
+the world is being aimed at. Sizing it by NDC rather than pixels hides a trap: on
 a small window a bar becomes a sub-pixel line, and a quad that narrow can fall between pixel
 centres and rasterize to *nothing* — so a test pins the crosshair's size in pixels at 1080p.
+
+The **pause menu** (`Esc`) is the other screen on that pipeline, and the first thing here to
+carry *words*. It offers **Continue** and **Exit**, and pausing does two things at once: the
+menu takes the cursor — a menu you cannot click is not a menu — and `App` stops updating the
+camera, so the world is frozen behind the panel rather than sliding about under it. Continue
+hands the cursor back; Exit stops the event loop; `Esc` does what Continue does. Opening the
+menu shuts the creative screen first, so exactly one screen ever holds the cursor, and the
+world's own input (look, clicks, the wheel, `E`, the number keys) is simply not consulted while
+it is up.
+
+There is no font file. `src/font.rs` is a **5×7 bitmap font** — one `u64` per glyph, seven rows
+of five bits, so `0b01110_10001_…` reads like the letter it draws — and every lit run of pixels
+in a glyph becomes a `NO_TEXTURE` quad whose tint *is* the ink. That is what lets the menu be
+readable while adding no asset, no second pipeline and no second bind group: it is more of the
+same HUD geometry the hotbar and the crosshair are made of. Two rules keep text legible at any
+window size: a line is sized by its *height* (the glyph is five by seven, so the width follows),
+and every horizontal measure is divided by the aspect ratio, exactly as an inventory cell is.
+`src/ui.rs` holds the pieces more than one screen needs — `Rect`, `UNIT_SQUARE`, `push_rect` and
+`push_bevel` — so the quick-access row, the creative screen, the pause menu, the tooltips and the
+font all place their quads the same way. A glyph's row is merged into runs before it is drawn, so a
+letter is a handful of quads rather than one per pixel.
+
+### The language
+
+What the game *calls* the things in it lives in a file, not in the code: every block and item has
+a label in **`resources/assets/lang/en.json`**, one flat JSON object, which is the shape
+Minecraft's own language files have.
+
+```json
+{ "block.grass_block": "Grass Block", "item.water_bucket": "Water Bucket" }
+```
+
+A key is a category and an id — `block.<id>` for a block, `item.<id>` for an item — and the id is
+the snake-case word the thing is known by (`Block::key`, `Item::key`), which is the same word its
+textures are named after. `Lang::label_of_block`/`label_of_item` are the two lookups;
+`Renderer` reads the file once at startup, beside the textures, and hands it to the screens.
+The labels are written the way Minecraft writes them — "Grass Block", not "GRASS BLOCK" — and the
+bitmap font folds them to upper case as it draws, because that is the register five pixels wide
+does well.
+
+They show up in two places, both of them Minecraft's:
+
+* the creative screen's **tooltip**, naming whatever the cursor is over;
+* the **caption** above the quick-access row, which names what is in hand for two seconds after it
+  changes — a slot key, the wheel, a pick-block, or a bucket emptying itself into the world. It is
+  what `Inventory::announcing` is for, and `mesh_data` takes the *clock* as an argument rather than
+  reading one, so the screen stays a pure function of its arguments. The renderer remembers
+  *whether the caption is up* in its HUD key, so the mesh is rebuilt once when it appears and once
+  when it lapses, and never in between.
+
+**The JSON reader is hand-rolled, and deliberately.** A language file is the only JSON in the
+project and holds one shape — an object whose values are strings — so `lang::parse_labels` reads
+exactly that and refuses everything else loudly, with the position in the message. That is a
+smaller thing than a JSON dependency and a much smaller thing than the bug it prevents: a file
+that grew a nested object being silently half-read. If the format ever needs more than a flat map,
+*that* is when to reach for a real parser rather than grow this one. A missing label is not fatal —
+the HUD falls back to the id, the way Minecraft prints the raw key — but a **test** holds the real
+file to every block and item, so forgetting a line fails the build rather than the picture.
 
 `Space`/`Shift` currently map to **up/down** because there is no gravity or
 ground yet; once the player/physics milestone lands they become jump/sneak and
@@ -960,15 +1213,27 @@ Work milestones in order; update the **Current status** section as they land.
    light of the blocks that *emit* it — **lava**, both the **lava sea** the carvers leave at the
    bottom of the world and any pool you place from the creative screen — which is lit
    *unshadowed*, so a pool lights the cave around it (see **Emissive blocks & block light**).
+   ✅ The **water surface** has a pass of its own: a normal built from the water texture read as a
+   height map and from drifting fBm, catching the sun as a highlight and the sky as a sheen (see
+   **The water surface** in **Transparency**).
+   ✅ **Full bright**: the `N` key, held down, lights every cell as if it held level 15 — the caves
+   included, and the sun's shadow put aside with it — so the underground can be read like open
+   ground (see **Lighting**). The sea asks for the same thing in the blend pass, so nothing is left
+   dark.
    Still to come: torches (the same `Block::light()` hook, a smaller number) and a point-light
    falloff for them in `lighting.wgsl`; cross-chunk light propagation; and a dappled canopy shadow
    and shadows on water (both small changes — see **Shadows**).
 7. **Player** — WASD + mouse-look, gravity and AABB collision, jumping.
 8. **Interaction** — ✅ voxel raycast break (right-click) and place (left-click), a
    **crosshair** marking the block being aimed at, a
-   nine-slot inventory chosen with `1`–`9` or the wheel, and a **creative inventory**
-   (`E`) whose palette draws every block as a 3D cube; affected chunks re-mesh
-   automatically.
+   nine-slot inventory chosen with `1`–`9` or the wheel, a **creative inventory**
+   (`E`) whose palette draws every block as a 3D cube, **pick block** on the wheel button, and a
+   **pause menu** (`Esc`) offering
+   **Continue** and **Exit** — the first screen here to be *labelled*, by the 5×7 bitmap font in
+   `src/font.rs`; affected chunks re-mesh automatically. The screens' shared quad primitives
+   live in `src/ui.rs`. **Buckets** (`src/item.rs`) put the fluids in and out of the world: a
+   slot holds an `Item` — a block or a bucket — which is why the palette draws a bucket as a
+   sprite and everything else as a cube (see **Buckets**).
 9. **Streaming** — ✅ chunks stream around the player, generated on **worker threads**
    (nearest first) while the frame loop only collects finished ones, and (re)meshed under a
    **time budget** so meshing shares the frame instead of owning it; a chunk is only meshed

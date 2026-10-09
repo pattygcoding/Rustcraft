@@ -39,6 +39,29 @@ pub enum Block {
 }
 
 impl Block {
+    /// Every block, in the order the enum declares them.
+    ///
+    /// A test helper, for the sweeps that go over the lot — the names the HUD prints, the culling
+    /// rules, the light questions — rather than for gameplay, which never needs a list of
+    /// everything. A new block belongs here as well as in [`Block::name`], whose match the
+    /// compiler already checks.
+    #[cfg(test)]
+    pub const ALL: [Block; 13] = [
+        Block::Air,
+        Block::Grass,
+        Block::Dirt,
+        Block::Stone,
+        Block::Bedrock,
+        Block::Water,
+        Block::Lava,
+        Block::Glass,
+        Block::OakLog,
+        Block::OakPlanks,
+        Block::OakLeaves,
+        Block::Poppy,
+        Block::Dandelion,
+    ];
+
     /// Whether this block is air, and so draws nothing.
     pub fn is_air(self) -> bool {
         matches!(self, Block::Air)
@@ -85,8 +108,10 @@ impl Block {
 
     /// A full opaque cube: it hides whatever is behind it and stops light dead.
     ///
-    /// Lava is on this list: you cannot see through it, and neither sunlight nor block light
-    /// spreads *into* it — light spreads out of it instead (see [`Block::light`]).
+    /// Lava is on this list for what it *looks* like and for its light: you cannot see through
+    /// it, and neither sunlight nor block light spreads *into* it — light spreads out of it
+    /// instead (see [`Block::light`]). It is deliberately *not* treated as a full cube for face
+    /// culling, because it does not fill its cell; see [`Block::hides_face_of`].
     pub fn is_opaque(self) -> bool {
         matches!(
             self,
@@ -142,6 +167,39 @@ impl Block {
         matches!(self, Block::Water | Block::Glass)
     }
 
+    /// The id this block is known by: snake case, and the same word its textures are named after —
+    /// `grass_block` for the block whose faces come from `grass_block_top` and `grass_block_side`.
+    ///
+    /// It is the second half of a language key: the label the HUD prints is `block.<id>` in
+    /// `resources/assets/lang/en.json` (see [`crate::lang`]), so the name of a thing travels in a
+    /// file rather than in a `match` here.
+    pub fn key(self) -> &'static str {
+        match self {
+            Block::Air => "air",
+            Block::Grass => "grass_block",
+            Block::Dirt => "dirt",
+            Block::Stone => "stone",
+            Block::Bedrock => "bedrock",
+            Block::Water => "water",
+            Block::Lava => "lava",
+            Block::Glass => "glass",
+            Block::OakLog => "oak_log",
+            Block::OakPlanks => "oak_planks",
+            Block::OakLeaves => "oak_leaves",
+            Block::Poppy => "poppy",
+            Block::Dandelion => "dandelion",
+        }
+    }
+
+    /// Whether the blended pass should **ripple** this block's surface: water, and only water.
+    ///
+    /// Water and glass are the two see-through kinds, and they share one draw — so the shader
+    /// cannot tell which of them it has, and a pane of glass is flat. This is what the mesher
+    /// marks a water face with, in the [`crate::gfx::mesh::WAVY`] bit of its packed shading.
+    pub fn ripples(self) -> bool {
+        matches!(self, Block::Water)
+    }
+
     /// Whether light can spread into this block: air, water, leaves and glass — but
     /// not a full opaque cube.
     pub fn lets_light_through(self) -> bool {
@@ -172,21 +230,36 @@ impl Block {
     /// A face can only be hidden when it lies flush against the neighbour, which is only
     /// true of a block that fills its cell — so nothing ever hides the planes of a cross
     /// sprite, and a flower stays visible against the wall beside it.
+    ///
+    /// **The fluids are the same case, one step further.** A fluid does *not* fill its cell:
+    /// it stops a hair short of the top (see [`Block::surface_height`]). A face it hid would
+    /// therefore leave a slit above its surface, and the neighbour's *missing* face would show
+    /// through it — the rock beside a pool, or the rock above it, reading as transparent along
+    /// a thin band at the waterline. So a fluid hides only its own kind, which stops short in
+    /// exactly the same way and so still lies flush against it (a pool has no faces inside it);
+    /// every other face around the pool stands, exactly as it does around water.
     pub fn hides_face_of(self, other: Block) -> bool {
         if !other.is_full_cube() {
             return false;
+        }
+        if self.is_fluid() {
+            return self == other;
         }
         self.is_opaque() || (self.is_translucent() && self == other)
     }
 
     /// Whether the player can break this block.
     ///
-    /// Bedrock is deliberately unbreakable, so you can't mine through the bottom of
-    /// the world. The fluids are never targeted in the first place (see
-    /// [`Block::is_targetable`]), so they never get here — and a placed block is how
-    /// you get rid of lava, exactly as it is how you clear water.
+    /// Everything but the air and the fluids: air is nothing to break, and the fluids are never
+    /// *targeted* in the first place (see [`Block::is_targetable`]) — a placed block is how you
+    /// get rid of lava, exactly as it is how you clear water.
+    ///
+    /// **Bedrock is breakable.** There is no survival mode to be kept out of the bottom of the
+    /// world with, and this is a sandbox: taking the floor apart is worth more than the floor
+    /// staying shut. (The *carvers* still leave it alone — that is [`Block::is_carveable`], which
+    /// is a different question with a different answer.)
     pub fn is_breakable(self) -> bool {
-        !matches!(self, Block::Air | Block::Bedrock) && !self.is_fluid()
+        !self.is_air() && !self.is_fluid()
     }
 
     /// Whether a ray can *hit* this block — see [`crate::world::World::raycast`].
@@ -473,18 +546,82 @@ mod tests {
         }
     }
 
+    /// Lava keeps its look — you cannot see through it, and it stops light dead — but its
+    /// *face culling* follows the rule every fluid follows, because it does not fill its cell.
     #[test]
-    fn lava_hides_faces_like_the_opaque_block_it_is() {
-        assert!(Block::Lava.hides_face_of(Block::Stone));
+    fn lava_is_opaque_but_culls_faces_like_the_fluid_it_is() {
+        assert!(Block::Lava.is_opaque());
+        assert!(!Block::Lava.is_blended());
+        assert!(!Block::Lava.is_translucent());
+
+        // A fluid hides only its own kind: no faces inside a pool, and every other face around
+        // it stands. Hiding the rock beside or above a pool is exactly what left a slit above
+        // the lava's surface with nothing drawn across it, through which the rock showed
+        // through as if it were transparent.
+        assert!(Block::Lava.hides_face_of(Block::Lava), "no faces in a pool");
         assert!(
-            Block::Lava.hides_face_of(Block::Lava),
-            "no faces inside a pool"
+            Block::Water.hides_face_of(Block::Water),
+            "no faces in the sea"
         );
-        assert!(Block::Stone.hides_face_of(Block::Lava));
-        assert!(Block::Lava.hides_face_of(Block::Water));
-        // Water hides only its own kind, so the lava under a shallow pool is still drawn
-        // through the water above it.
+        assert!(
+            !Block::Lava.hides_face_of(Block::Stone),
+            "the rock beside a pool must keep its face"
+        );
+        assert!(
+            !Block::Lava.hides_face_of(Block::Dirt) && !Block::Lava.hides_face_of(Block::OakLeaves),
+            "and so must the rock above one"
+        );
+        assert!(!Block::Lava.hides_face_of(Block::Water));
         assert!(!Block::Water.hides_face_of(Block::Lava));
+
+        // The fluid's *own* face is still hidden by what it is flush against: an opaque
+        // neighbour, so a pool has no face buried in its bank.
+        for solid in [
+            Block::Stone,
+            Block::Dirt,
+            Block::Grass,
+            Block::OakLog,
+            Block::OakPlanks,
+        ] {
+            assert!(solid.hides_face_of(Block::Lava), "{solid:?} hides the lava");
+        }
+        // ...but not glass, which is see-through: lava under a pane is still seen.
+        assert!(!Block::Glass.hides_face_of(Block::Lava));
+    }
+
+    /// The invariant the mesher leans on, stated so it cannot drift: a block may only hide a
+    /// neighbour's face when the two fill the same space at it. The fluids are the one block
+    /// that stops short of the top of its cell ([`Block::surface_height`]), so a face a fluid
+    /// hid would leave a slit above its surface — and the neighbour's *missing* face would show
+    /// through that slit. A fluid therefore hides nothing but its own kind, which is short in
+    /// exactly the same way and so still lies flush against it.
+    #[test]
+    fn a_block_that_stops_short_of_its_cell_hides_only_its_own_kind() {
+        let blocks = [
+            Block::Air,
+            Block::Grass,
+            Block::Dirt,
+            Block::Stone,
+            Block::Bedrock,
+            Block::Water,
+            Block::Lava,
+            Block::Glass,
+            Block::OakLog,
+            Block::OakPlanks,
+            Block::OakLeaves,
+            Block::Poppy,
+            Block::Dandelion,
+        ];
+        for short in blocks.iter().copied().filter(|b| b.surface_height() < 1.0) {
+            for other in blocks {
+                if other != short {
+                    assert!(
+                        !short.hides_face_of(other),
+                        "{short:?} stops short of its cell, so it cannot hide {other:?}'s face"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -524,8 +661,10 @@ mod tests {
         }
     }
 
+    /// Everything but the air and the fluids can be mined — and that includes bedrock: there is no
+    /// survival mode to be kept out of the bottom of the world with.
     #[test]
-    fn everything_but_the_fluids_and_bedrock_can_be_mined() {
+    fn everything_but_the_air_and_the_fluids_can_be_mined() {
         for block in [
             Block::Grass,
             Block::Dirt,
@@ -536,14 +675,27 @@ mod tests {
             Block::Glass,
             Block::Poppy,
             Block::Dandelion,
+            Block::Bedrock,
         ] {
             assert!(block.is_breakable(), "{block:?} can be mined");
         }
-        // The fluids are aimed through rather than at, so they never come up for breaking;
-        // a placed block is how you clear either of them.
-        for block in [Block::Air, Block::Water, Block::Lava, Block::Bedrock] {
+        // Air is nothing to break, and the fluids are aimed *through* rather than at, so they
+        // never come up for breaking; a placed block is how you clear either of them.
+        for block in [Block::Air, Block::Water, Block::Lava] {
             assert!(!block.is_breakable(), "{block:?} cannot be mined");
         }
+    }
+
+    /// Breaking and *carving* are different questions, and bedrock is where they part company: the
+    /// player may take the floor of the world apart, and a cave or a ravine still may not cut
+    /// through it.
+    #[test]
+    fn bedrock_can_be_mined_but_not_carved() {
+        assert!(Block::Bedrock.is_breakable(), "the player may mine it");
+        assert!(
+            !Block::Bedrock.is_carveable(),
+            "a carver may not cut through it"
+        );
     }
 
     #[test]

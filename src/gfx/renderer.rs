@@ -23,6 +23,7 @@
 //! streamed chunks and drops meshes for unloaded ones.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -36,6 +37,8 @@ use super::shadow::{self, ShadowMap, Sun};
 use super::texture::BlockTextures;
 use crate::camera::Camera;
 use crate::inventory::Inventory;
+use crate::lang::Lang;
+use crate::pause::{Action, PauseMenu};
 use crate::world::{CHUNK_SIZE, World, mesh_chunk};
 
 /// Background colour used to clear each frame (a daytime sky blue).
@@ -68,14 +71,11 @@ const NORMAL_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 /// chunk per frame, however slow that chunk is, so a backlog still drains.
 const MESH_BUDGET: Duration = Duration::from_millis(3);
 
-/// `shaders/sun.wgsl`: the lighting maths every pass shares.
-///
-/// WGSL has no `#include`, so [`compose`] pastes this onto the front of each shader at load
-/// time. It is the one definition of the face shade and how the sun and the ambient stack up.
-/// (The light *curve* is not here: smoothing averages brightness, so the mesher applies it.)
-const SHARED_SHADER: &str = include_str!("../../shaders/sun.wgsl");
-
 /// The per-frame data handed to the shaders.
+///
+/// One buffer, shared by every pass, so a field is declared here whether or not every pass reads
+/// it — which is why `shaders/block.wgsl` spells out the same layout, and why a test pins the
+/// offsets the two have to agree on.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct Globals {
@@ -84,11 +84,54 @@ struct Globals {
     /// Its inverse. Only the lighting pass needs it, to turn a pixel's depth back into a
     /// world position — but all three passes share one buffer, so it is always here.
     inv_view_proj: [[f32; 4]; 4],
+    /// The sun, as a unit vector pointing *toward* it, and where the camera is. Only the water's
+    /// ripples read them: nothing else in the picture asks which way the sun faces, which is why
+    /// there is no `dot(N, L)` anywhere else. `w` pads each to a `vec4`'s sixteen bytes.
+    sun_direction: [f32; 4],
+    eye_position: [f32; 4],
+    /// Seconds since the renderer started, for the water to drift on, and then the per-frame
+    /// *view options* — read by the passes that light something, never by the ones that project
+    /// geometry. A `u32` because a switch is not a number, and the two `f32`s after it are
+    /// padding: a uniform buffer's size is a multiple of sixteen bytes.
+    time: f32,
+    /// Non-zero while the player holds the **full bright** key (`N`): light every cell as if it
+    /// held level 15, which is what makes a cave as visible as open ground. See
+    /// `shaders/lighting.wgsl`.
+    full_bright: u32,
+    _padding: [f32; 2],
 }
 
-/// Paste a shader body onto the shared sunlight prelude.
-fn compose(body: &str) -> wgpu::ShaderSource<'static> {
-    wgpu::ShaderSource::Wgsl(format!("{SHARED_SHADER}\n{body}").into())
+/// The shared sunlight prelude: the face shade, the sun/ambient mix and the tint maths.
+///
+/// WGSL has no `#include`, so [`compose`] pastes these onto the front of every shader. One
+/// definition, three users — the deferred pass, the blended water and the HUD — instead of three
+/// copies that drift.
+const SHARED_SHADER: &str = include_str!("../../shaders/sun.wgsl");
+
+/// The water surface: fBm ripples and a normal from the height map.
+///
+/// Only `block.wgsl` gets this one — it is where the blended pass lives — so it is a separate
+/// prelude rather than part of [`SHARED_SHADER`].
+const WATER_SHADER: &str = include_str!("../../shaders/water.wgsl");
+
+/// The source of a shader: the shared preludes, and then the body, in that order.
+///
+/// Kept apart from [`compose`] so a test can hand the result to a WGSL parser without a GPU.
+fn shader_source(preludes: &[&str], body: &str) -> String {
+    let mut source = String::with_capacity(SHARED_SHADER.len() + body.len() + 64);
+    source.push_str(SHARED_SHADER);
+    for prelude in preludes {
+        source.push('\n');
+        source.push_str(prelude);
+    }
+    source.push('\n');
+    source.push_str(body);
+    source
+}
+
+/// Paste a shader body onto the shared sunlight prelude, for wgpu.
+fn compose(preludes: &[&str], body: &str) -> wgpu::ShaderSource<'static> {
+    wgpu::ShaderSource::Wgsl(shader_source(preludes, body).into())
 }
 
 /// The G-buffer: what the geometry pass leaves behind for the lighting pass to light.
@@ -153,6 +196,29 @@ impl GBuffer {
     }
 }
 
+/// Everything the HUD mesh is built from, so a frame can tell whether it has to be rebuilt:
+/// the quick-access selection, the viewport, which screens are up, and where the cursor is
+/// (quantised, because floats cannot be compared for equality).
+///
+/// Named fields rather than a tuple: it now spans two screens, and a six-tuple whose field
+/// order nobody can remember is exactly the thing that goes stale without anyone noticing. The
+/// pause menu needs no cursor of its own — a *hovered button* is the whole of what its cursor
+/// changes, so the button is what the key holds.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct HudKey {
+    selected: usize,
+    width: u32,
+    height: u32,
+    inventory_open: bool,
+    cursor: [i32; 2],
+    paused: bool,
+    menu_hovered: Option<Action>,
+    /// Whether the caption naming what is in hand is up. It goes away on its own after a moment,
+    /// so *this* is what tells a frame that the mesh has to be built again — once when the caption
+    /// appears and once when it lapses, and not a single time in between.
+    caption: bool,
+}
+
 /// Draws a single window using a [`GraphicsContext`].
 pub struct Renderer {
     context: GraphicsContext,
@@ -166,11 +232,11 @@ pub struct Renderer {
     shadow_pipeline: wgpu::RenderPipeline,
     /// Pipeline for the one fullscreen pass that lights the G-buffer.
     lighting_pipeline: wgpu::RenderPipeline,
-    /// The inventory HUD mesh, rebuilt when anything it draws changes.
+    /// The HUD mesh — the inventory, and whichever screen stands over it — rebuilt whenever
+    /// anything it draws changes.
     hud_mesh: Option<Mesh>,
-    /// What the HUD mesh was built for: the selection, the viewport, whether the creative
-    /// screen is open, and the cursor (quantised, so it can be compared).
-    hud_key: Option<(usize, u32, u32, bool, i32, i32)>,
+    /// What the HUD mesh was built for. See [`HudKey`].
+    hud_key: Option<HudKey>,
     /// One mesh per loaded chunk, keyed by chunk coordinate.
     chunk_meshes: HashMap<(i32, i32), Mesh>,
     /// This frame's chunk draw order, nearest first. Reused between frames so
@@ -178,6 +244,9 @@ pub struct Renderer {
     draw_order: Vec<((i32, i32), f32)>,
     /// The block texture array; also used to mesh streamed chunks.
     textures: BlockTextures,
+    /// What the HUD calls the things in it — the labels the tooltip and the caption print, read
+    /// once at startup from `resources/assets/lang/en.json` (see [`crate::lang`]).
+    lang: Lang,
     /// Uniform buffer holding the [`Globals`] for the current frame.
     globals: wgpu::Buffer,
     /// The G-buffer, and the bind group that hands it to the lighting pass. Both are
@@ -187,6 +256,9 @@ pub struct Renderer {
     gbuffer_bind_group: wgpu::BindGroup,
     /// The scene bind group: the shared transform and the block textures.
     bind_group: wgpu::BindGroup,
+    /// When this renderer was built, so a frame can say how long the world has been running: the
+    /// water's ripples drift on that clock, and nothing else needs a clock at all.
+    started: Instant,
     /// The sun: where it is, and the map of what it can see.
     sun: Sun,
     shadow_map: ShadowMap,
@@ -213,7 +285,7 @@ impl Renderer {
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("block-shader"),
-            source: compose(include_str!("../../shaders/block.wgsl")),
+            source: compose(&[WATER_SHADER], include_str!("../../shaders/block.wgsl")),
         });
         // The shadow pass needs nothing but a matrix, so it takes no prelude.
         let shadow_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -222,7 +294,7 @@ impl Renderer {
         });
         let lighting_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("lighting-shader"),
-            source: compose(include_str!("../../shaders/lighting.wgsl")),
+            source: compose(&[], include_str!("../../shaders/lighting.wgsl")),
         });
 
         // A uniform buffer to hold the transforms for each frame.
@@ -243,19 +315,33 @@ impl Renderer {
         });
         let shadow_map = ShadowMap::new(device);
 
-        // Load every PNG under `resources/assets/textures/blocks` into one array texture.
+        // Every PNG under the two texture directories, into one array: the blocks, and the items
+        // that are drawn beside them (buckets), which share the pipeline and the bind group.
         let textures = BlockTextures::load(
             context.device(),
             context.queue(),
-            concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/resources/assets/textures/blocks"
-            ),
+            &[
+                Path::new(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/resources/assets/textures/blocks"
+                )),
+                Path::new(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/resources/assets/textures/items"
+                )),
+            ],
         );
         log::info!(
             "block texture array has {} layers",
             textures.array().layer_count()
         );
+
+        // The labels the HUD prints, from the one language file there is. A second language would
+        // be a second file beside it (see `lang`).
+        let lang = Lang::load(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/resources/assets/lang/en.json"
+        ));
 
         let bind_group_layout =
             context
@@ -263,10 +349,12 @@ impl Renderer {
                 .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                     label: Some("scene-layout"),
                     entries: &[
-                        // 0: the per-frame transform.
+                        // 0: the per-frame transform — and, for the water, the sun and the eye.
+                        // Read by the fragment stage too, which is what the water's highlight
+                        // needs an eye for, so both stages have to see it.
                         wgpu::BindGroupLayoutEntry {
                             binding: 0,
-                            visibility: wgpu::ShaderStages::VERTEX,
+                            visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                             ty: wgpu::BindingType::Buffer {
                                 ty: wgpu::BufferBindingType::Uniform,
                                 has_dynamic_offset: false,
@@ -349,7 +437,7 @@ impl Renderer {
         // quads with a shader that skips the transform.
         let ui_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("ui-shader"),
-            source: compose(include_str!("../../shaders/ui.wgsl")),
+            source: compose(&[], include_str!("../../shaders/ui.wgsl")),
         });
         let ui_pipeline =
             create_pipeline(device, &pipeline_layout, &ui_shader, &[format], true, "ui");
@@ -445,25 +533,47 @@ impl Renderer {
             // Nothing has been drawn into the shadow map yet.
             shadow_stale: true,
             mesh_millis: 0.0,
+            started: Instant::now(),
+            lang,
         }
     }
 
-    /// Rebuild the inventory HUD whenever anything it draws has changed.
-    fn ensure_hud(&mut self, inventory: &Inventory) {
-        let cursor = inventory.cursor_key();
-        let key = (
-            inventory.selected_index(),
-            self.context.config().width,
-            self.context.config().height,
-            inventory.is_open(),
-            cursor[0],
-            cursor[1],
-        );
+    /// Rebuild the HUD whenever anything either screen draws has changed.
+    fn ensure_hud(&mut self, inventory: &Inventory, pause: &PauseMenu) {
+        let (width, height) = {
+            let config = self.context.config();
+            (config.width, config.height)
+        };
+        // The clock the caption above the quick-access row is measured against. Read here, passed
+        // down, and remembered in the key as whether it is up — so the mesh is rebuilt the moment
+        // the caption appears and the moment it lapses, and never in between.
+        let now = Instant::now();
+        let key = HudKey {
+            selected: inventory.selected_index(),
+            width,
+            height,
+            inventory_open: inventory.is_open(),
+            cursor: inventory.cursor_key(),
+            paused: pause.is_open(),
+            menu_hovered: pause.hovered(),
+            caption: inventory.announcing(now),
+        };
         if self.hud_key == Some(key) {
             return;
         }
-        let data = inventory.mesh_data(&self.textures, self.aspect());
-        self.hud_mesh = Some(Mesh::upload(self.context.device(), "inventory", &data));
+
+        let aspect = self.aspect();
+        // The crosshair marks the block a click would act on, so it belongs on screen only
+        // while nothing stands between the player and the world.
+        let aiming = !inventory.is_open() && !pause.is_open();
+        let mut data = inventory.mesh_data(&self.textures, aspect, aiming, &self.lang, now);
+        // The pause menu is drawn *into* the same geometry, and after the inventory, so it
+        // blends over the quick-access row rather than fighting it for the top of the screen.
+        if pause.is_open() {
+            pause.push_geometry(&mut data.opaque, aspect);
+        }
+
+        self.hud_mesh = Some(Mesh::upload(self.context.device(), "hud", &data));
         self.hud_key = Some(key);
     }
 
@@ -557,9 +667,21 @@ impl Renderer {
     }
 
     /// Render one frame from `camera`: fill the shadow map, fill the G-buffer, light it, then
-    /// blend the world's translucent geometry and the `inventory` HUD over the result.
-    pub fn render(&mut self, camera: &Camera, inventory: &Inventory) {
-        self.ensure_hud(inventory);
+    /// blend the world's translucent geometry and the HUD — the `inventory`, and the `pause`
+    /// menu over it — on top of the result.
+    ///
+    /// `full_bright` is the view option the `N` key holds down: light every cell as if it held
+    /// level 15, whatever it really holds. It travels in the per-frame uniform rather than as a
+    /// pipeline state, because it changes no geometry — only the number the lighting pass starts
+    /// from.
+    pub fn render(
+        &mut self,
+        camera: &Camera,
+        inventory: &Inventory,
+        pause: &PauseMenu,
+        full_bright: bool,
+    ) {
+        self.ensure_hud(inventory, pause);
         self.order_chunks(camera);
 
         // Move the sun's box onto the player, and rewrite its matrix only when that moved the
@@ -580,9 +702,15 @@ impl Renderer {
         // view-projection is the whole transform. The lighting pass also wants its inverse, to
         // get from a pixel's depth back to a world position.
         let view_proj = camera.view_projection(self.aspect());
+        let sun = shadow::direction();
         let globals = Globals {
             view_proj: view_proj.to_cols_array_2d(),
             inv_view_proj: view_proj.inverse().to_cols_array_2d(),
+            sun_direction: [sun.x, sun.y, sun.z, 0.0],
+            eye_position: [camera.position.x, camera.position.y, camera.position.z, 0.0],
+            time: self.started.elapsed().as_secs_f32(),
+            full_bright: u32::from(full_bright),
+            _padding: [0.0; 2],
         };
         self.context
             .queue()
@@ -759,7 +887,8 @@ impl Renderer {
                 }
             }
 
-            // Finally the inventory HUD, drawn on top in screen space.
+            // Finally the HUD, drawn on top in screen space: the quick-access row, and then
+            // whichever screen (the creative inventory, the pause menu) is over it.
             if let Some(hud) = &self.hud_mesh {
                 pass.set_pipeline(&self.ui_pipeline);
                 pass.set_bind_group(0, &self.bind_group, &[]);
@@ -1039,4 +1168,77 @@ fn create_gbuffer_bind_group(
             },
         ],
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **Every shader parses and validates** — a GPU-free way to catch the one kind of mistake
+    /// this project cannot otherwise compile-check.
+    ///
+    /// WGSL is a string as far as `rustc` is concerned, so a typo in it is only found when the
+    /// game opens a window and wgpu refuses the module (or, worse, when it does not). `naga` is
+    /// the front end and validator wgpu itself uses, and already in the tree as its dependency —
+    /// so this runs the real thing, without a device.
+    #[test]
+    fn every_shader_parses_and_validates() {
+        let sources = [
+            (
+                "block",
+                shader_source(&[WATER_SHADER], include_str!("../../shaders/block.wgsl")),
+            ),
+            (
+                "lighting",
+                shader_source(&[], include_str!("../../shaders/lighting.wgsl")),
+            ),
+            (
+                "ui",
+                shader_source(&[], include_str!("../../shaders/ui.wgsl")),
+            ),
+            (
+                "shadow",
+                include_str!("../../shaders/shadow.wgsl").to_owned(),
+            ),
+        ];
+
+        for (name, source) in sources {
+            let module = naga::front::wgsl::parse_str(&source).unwrap_or_else(|err| {
+                panic!(
+                    "{name}.wgsl does not parse:\n{}",
+                    err.emit_to_string(&source)
+                )
+            });
+            naga::valid::Validator::new(
+                naga::valid::ValidationFlags::all(),
+                naga::valid::Capabilities::empty(),
+            )
+            .validate(&module)
+            .unwrap_or_else(|err| {
+                panic!(
+                    "{name}.wgsl does not validate:\n{}",
+                    err.emit_to_string(&source)
+                )
+            });
+        }
+    }
+
+    /// The uniform Rust writes and the one the shaders read have to agree byte for byte.
+    ///
+    /// WGSL lays a `vec4` out at sixteen bytes and a bare `f32` at four, and a field that moved
+    /// on one side without the other being told would not fail to compile: it would quietly light
+    /// the water with the wrong numbers. This is the test that would notice.
+    #[test]
+    fn the_globals_layout_is_the_one_the_shaders_expect() {
+        use std::mem::{offset_of, size_of};
+        assert_eq!(offset_of!(Globals, view_proj), 0);
+        assert_eq!(offset_of!(Globals, inv_view_proj), 64);
+        assert_eq!(offset_of!(Globals, sun_direction), 128);
+        assert_eq!(offset_of!(Globals, eye_position), 144);
+        assert_eq!(offset_of!(Globals, time), 160);
+        assert_eq!(offset_of!(Globals, full_bright), 164);
+        // A uniform buffer's size is a multiple of sixteen bytes; the padding makes it so.
+        assert_eq!(size_of::<Globals>(), 176);
+        assert!(size_of::<Globals>().is_multiple_of(16));
+    }
 }
